@@ -2,17 +2,20 @@ import polars as pl
 from typing import Literal
 
 class _BaseRanker():
-    def __init__(self, returnformat: Literal["id","dicts","dataframe"]):
+    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric=None):
         self.required_keys = None
         self.returnformat = returnformat
+        self.metric = metric
 
     def _transform_input(self, data) -> pl.DataFrame:
         """not fully implemented yet, ensure that we can process dataframes but also list of dicts """
         if type(data) is list:
-            assert self.required_keys.issubset(data[0].keys()) 
+            if self.required_keys is not None:
+                assert self.required_keys.issubset(data[0].keys()) 
             return pl.from_dicts(data)
         elif type(data) is pl.DataFrame:
-            assert self.required_keys.issubset(data.keys()) 
+            if self.required_keys is not None:
+                assert self.required_keys.issubset(data.keys()) 
             return data
         else:
             raise ValueError("Data format not supported")
@@ -39,10 +42,12 @@ class _BaseRanker():
 class TrivialRanker(_BaseRanker):
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """This ranker just keeps the order of the input"""
-        return data
+        df = self._transform_input(data)
+        return self._transform_output(df)
+
 
 class PopularityRanker(_BaseRanker):
-    def __init__(self, returnformat: Literal["id","dicts","dataframe"]):
+    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric: Literal['quote_count',  'reply_count',  'repost_count'] ):
         self.required_keys = {'cid', 'indexed_at', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
 
@@ -64,8 +69,8 @@ def sampledata(filename="example_news.csv"):
 if __name__=="__main__":
     print("Testing the bluesky ranker...")
     data = sampledata()
-    ranker = PopularityRanker(returnformat='id')
-    ranker2 = PopularityRanker(returnformat='dataframe')
+    ranker = TrivialRanker(returnformat='id')
+    ranker2 = PopularityRanker(returnformat='dataframe', metric= "reply_count")
 
     print(ranker.rank(data)[:10])
     print(ranker2.rank(data)[:10])
