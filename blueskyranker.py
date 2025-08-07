@@ -214,9 +214,15 @@ if __name__=="__main__":
 
     #print(ranker.rank(data)[:10])
     #print(ranker2.rank(data)[:10])
-    print(ranker3.rank(data)[:10])
-
     # SBERT IS TOO SLOW TO RUN ON 1000 DOCS, we only do less
     #print(ranker4.rank(data[:40])[:10])
+    
+    ranking = ranker3.rank(data)
+    print("Printing the results in the chosen format (dataframe (full dataframe), dicts (list of dicts for generic use), or id only (for just sending the ID to a server)")
+    print("Printing only the first 10 items")
+    print()
+    print(ranking[:10])
+
+
 
 
