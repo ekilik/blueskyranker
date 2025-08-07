@@ -1,7 +1,11 @@
 import polars as pl
 from typing import Literal
 import logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG,
+    format='%(asctime)s %(levelname)-8s %(message)s',
+    #datefmt='%Y-%m-%d %H:%M:%S')
+    datefmt='%H:%M:%S')
+
 
 # for topic ranker:
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer  
@@ -72,30 +76,46 @@ class TopicRanker(_BaseRanker):
     def __init__(self, 
             returnformat: Literal["id","dicts","dataframe"],
             metric: Literal['quote_count',  'reply_count',  'repost_count'], 
-            method: Literal['networkclustering']):
+            method: Literal['networkclustering', 'bert']):
         self.required_keys = {'cid', 'indexed_at', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
         self.metric = metric
         self.method = method
     
-    def _cluster(self, data: pl.DataFrame, threshold = .2):
+    def _cluster(self, data: pl.DataFrame, threshold = .2, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
         """This function clusters the texts using the Leiden Algorithm by Traag, Waltman, & Van Eck (2019),
         following the approach Trilling & Van Hoof (2020) suggest news event clustering.
         It adds a column "cluster" and a column "clustersize" to the dataframe.
         """
         logging.debug("Creating cosine similarity matrix...")
-        vectorizer = TfidfVectorizer()   # Or, if wanted, CountVectorizer
-        bow = vectorizer.fit_transform(data['text'])
-        cosine_sim_matrix = cosine_similarity(bow)
+        if similarity =='tfidf-cosine':
+            vectorizer = TfidfVectorizer()   
+            bow = vectorizer.fit_transform(data['text'])
+            sim_matrix = cosine_similarity(bow)
+        elif similarity =='count-cosine':
+            vectorizer = CountVectorizer()   
+            bow = vectorizer.fit_transform(data['text'])
+            sim_matrix = cosine_similarity(bow)
+        elif similarity == 'sbert-cosine':
+            # import here to avoid forcing everyone to install this huge library
+            from sentence_transformers import SentenceTransformer
+            sbert_model = SentenceTransformer('sentence-transformers/distiluse-base-multilingual-cased-v2',  model_kwargs={"torch_dtype": "float16"})
+            embeddings = sbert_model.encode(data['text'], show_progress_bar=True)
+            sim_matrix = cosine_similarity(embeddings)
+        else:
+            raise NotImplementedError(f"Simiarity {similarity} is not implemented")
+
         logging.debug(f"Removing all entries below a threshold of {threshold}")
-        filtered_matrix = np.where(cosine_sim_matrix >= threshold, cosine_sim_matrix, 0)
+        filtered_matrix = np.where(sim_matrix >= threshold, sim_matrix, 0)
         sparsity = 1.0 -(np.count_nonzero(filtered_matrix) / float(filtered_matrix.size) )
         logging.debug(f"The new matrix is {sparsity:.2%} sparse")
         logging.debug("Creating a graph")
         g = ig.Graph.Weighted_Adjacency(filtered_matrix.tolist(), mode="UNDIRECTED", attr="weight")
         g.vs["cid"] = data['cid']
         logging.debug("Apply network clustering using the Leiden Algorithm")
-        part = leidenalg.find_partition(g, leidenalg.SurpriseVertexPartition)
+        # The Surprise didn't work too well on these data, resort to Modularity:
+        # part = leidenalg.find_partition(g, leidenalg.SurpriseVertexPartition, weights='weight')
+        part = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, weights='weight')
         partitions = []
         for subgraph in part.subgraphs():
             partitions.append([node['cid'] for node in subgraph.vs])
@@ -109,10 +129,19 @@ class TopicRanker(_BaseRanker):
         return data
         
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
-        """This ranker just keeps the order of the input"""
+        """This ranker clusters the input by topic, and then creates a feedback loop by
+        upranking the most popular topic"""
         df = self._transform_input(data)
-        if self.method == 'networkclustering':
-            df_with_clusters = self._cluster(df)
+
+        if self.method == 'networkclustering-tfidf':
+            df_with_clusters = self._cluster(df, similarity='tfidf-cosine')
+        if self.method == 'networkclustering-count':
+            df_with_clusters = self._cluster(df, similarity='count-cosine')
+        if self.method == 'networkclustering-sbert':
+            if len(data)>100:
+                logger.warning(f"Do you really want to do this? You have {len(data)} texts, calculating sentence embeddings will be REALLY slow")
+                logger.warning(f"Consider using another method, or submitting less document")
+            df_with_clusters = self._cluster(df, similarity='sbert-cosine')
               
         # TODO The ranking is now very simplistic, we simply rank by cluster size
         # TODO Hence, the most popular topic gets more popular.
@@ -136,9 +165,14 @@ if __name__=="__main__":
     data = sampledata()
     #ranker = TrivialRanker(returnformat='id')
     #ranker2 = PopularityRanker(returnformat='dicts', metric= "reply_count")
-    ranker3 = TopicRanker(returnformat='dataframe', metric= None, method = 'networkclustering')
+    ranker3 = TopicRanker(returnformat='dataframe', metric= None, method = 'networkclustering-tfidf')
+    ranker4 = TopicRanker(returnformat='dataframe', metric= None, method = 'networkclustering-sbert')
 
     #print(ranker.rank(data)[:10])
     #print(ranker2.rank(data)[:10])
     print(ranker3.rank(data)[:10])
+
+    # SBERT IS TOO SLOW TO RUN ON 1000 DOCS, we only do the first 100
+    print(ranker4.rank(data[:100])[:10])
+
 
