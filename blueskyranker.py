@@ -210,13 +210,13 @@ if __name__=="__main__":
     #ranker = TrivialRanker(returnformat='id')
     #ranker2 = PopularityRanker(returnformat='dicts', metric= "reply_count")
     ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf')
-    ranker4 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
+    #ranker4 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
 
     #print(ranker.rank(data)[:10])
     #print(ranker2.rank(data)[:10])
     print(ranker3.rank(data)[:10])
 
     # SBERT IS TOO SLOW TO RUN ON 1000 DOCS, we only do less
-    print(ranker4.rank(data[:40])[:10])
+    #print(ranker4.rank(data[:40])[:10])
 
 
