@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import polars as pl
 from typing import Literal
 from itertools import zip_longest
@@ -127,10 +128,25 @@ class TopicRanker(_BaseRanker):
 
         clusterassignment = [[article, cluster] for cluster, articles in enumerate(partitions) for article in articles]
         clusterassignment_df = pl.DataFrame(clusterassignment,orient='row', schema=["cid","cluster"])
-        clusterassignment_df = clusterassignment_df.join(clusterassignment_df.group_by('cluster').len(), on='cluster').rename({'len':'clustersize'})
+        #clusterassignment_df = clusterassignment_df.join(clusterassignment_df.group_by('cluster').len(), on='cluster').rename({'len':'clustersize'})
         data = data.join(clusterassignment_df, on='cid')
-        
+        data = self._add_cluster_stats(data)
         return data
+
+    def _add_cluster_stats(self, df_with_clusters):
+        """takes dataframe with cluster labels and adds cluster statistics"""
+        clusterstats = df_with_clusters.group_by('cluster').agg(pl.col('like_count').sum(),
+            pl.col('reply_count').sum(),
+            pl.col('quote_count').sum(),
+            pl.col('repost_count').sum(),
+            pl.len())
+        # TODO: MAYBE WEIGH THIS, SUCH THAT A LIKE COUNTS LESS THAN A REPLY?
+        clusterstats = clusterstats.with_columns(sum=pl.sum_horizontal("reply_count", "like_count",'repost_count','quote_count'))
+        clusterstats = clusterstats.with_columns(engagement_rank=clusterstats["sum"].rank(method='random', descending=True)).rename({'sum':'engagement_count', 'len':'size'})
+        clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({"cluster_cluster": "cluster"})
+        df_with_clusters = df_with_clusters.join(clusterstats, on="cluster")
+        return df_with_clusters
+        
         
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """This ranker clusters the input by topic, and then creates a feedback loop by
@@ -157,16 +173,6 @@ class TopicRanker(_BaseRanker):
         # But we do sth more fancy:
         # We now return the articles sorted by the cluster engagement rank
 
-        clusterstats = df_with_clusters.group_by('cluster').agg(pl.col('like_count').sum(), 
-            pl.col('reply_count').sum(),
-            pl.col('quote_count').sum(),
-            pl.col('repost_count').sum())
-        # TODO: MAYBE WEIGH THIS, SUCH THAT A LIKE COUNTS LESS THAN A REPLY?
-        clusterstats = clusterstats.with_columns(sum=pl.sum_horizontal("reply_count", "like_count",'repost_count','quote_count'))
-        clusterstats = clusterstats.with_columns(engagement_rank=clusterstats["sum"].rank(method='random', descending=True)).rename({'sum':'engagement_count'})
-        clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({"cluster_cluster": "cluster"})
-        df_with_clusters = df_with_clusters.join(clusterstats, on="cluster")
-        
         df_with_clusters = df_with_clusters.sort(by='cluster_engagement_rank')
         
         # TODO: Implement saturation here, such that we do not have just the same things from the same cluster
@@ -210,7 +216,7 @@ if __name__=="__main__":
     #print(ranker2.rank(data)[:10])
     print(ranker3.rank(data)[:10])
 
-    # SBERT IS TOO SLOW TO RUN ON 1000 DOCS, we only do the first 100
-    print(ranker4.rank(data[:100])[:10])
+    # SBERT IS TOO SLOW TO RUN ON 1000 DOCS, we only do less
+    print(ranker4.rank(data[:40])[:10])
 
 
