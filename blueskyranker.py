@@ -69,15 +69,19 @@ class PopularityRanker(_BaseRanker):
 
 
 class TopicRanker(_BaseRanker):
-    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric: Literal['quote_count',  'reply_count',  'repost_count'] ):
+    def __init__(self, 
+            returnformat: Literal["id","dicts","dataframe"],
+            metric: Literal['quote_count',  'reply_count',  'repost_count'], 
+            method: Literal['networkclustering']):
         self.required_keys = {'cid', 'indexed_at', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
         self.metric = metric
+        self.method = method
     
     def _cluster(self, data: pl.DataFrame, threshold = .2):
         """This function clusters the texts using the Leiden Algorithm by Traag, Waltman, & Van Eck (2019),
         following the approach Trilling & Van Hoof (2020) suggest news event clustering.
-        It adds a column "cluster" to the dataframe.
+        It adds a column "cluster" and a column "clustersize" to the dataframe.
         """
         logging.debug("Creating cosine similarity matrix...")
         vectorizer = TfidfVectorizer()   # Or, if wanted, CountVectorizer
@@ -99,6 +103,7 @@ class TopicRanker(_BaseRanker):
 
         clusterassignment = [[article, cluster] for cluster, articles in enumerate(partitions) for article in articles]
         clusterassignment_df = pl.DataFrame(clusterassignment,orient='row', schema=["cid","cluster"])
+        clusterassignment_df = clusterassignment_df.join(clusterassignment_df.group_by('cluster').len(), on='cluster').rename({'len':'clustersize'})
         data = data.join(clusterassignment_df, on='cid')
         
         return data
@@ -106,10 +111,16 @@ class TopicRanker(_BaseRanker):
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """This ranker just keeps the order of the input"""
         df = self._transform_input(data)
-        clusters = self._cluster(df)
-        # TODO THERE IS NO RANKING YET, WE JUST RETURN THE ADDED CLUSTER
-        
-        return self._transform_output(clusters)
+        if self.method == 'networkclustering':
+            df_with_clusters = self._cluster(df)
+              
+        # TODO The ranking is now very simplistic, we simply rank by cluster size
+        # TODO Hence, the most popular topic gets more popular.
+        # TODO Implement more sophisticated algo
+
+        df_with_clusters.sort(by='clustersize', descending=True)
+
+        return self._transform_output(df_with_clusters)
 
 
 def sampledata(filename="example_news.csv"):
@@ -125,7 +136,7 @@ if __name__=="__main__":
     data = sampledata()
     #ranker = TrivialRanker(returnformat='id')
     #ranker2 = PopularityRanker(returnformat='dicts', metric= "reply_count")
-    ranker3 = TopicRanker(returnformat='dataframe', metric= None)
+    ranker3 = TopicRanker(returnformat='dataframe', metric= None, method = 'networkclustering')
 
     #print(ranker.rank(data)[:10])
     #print(ranker2.rank(data)[:10])
