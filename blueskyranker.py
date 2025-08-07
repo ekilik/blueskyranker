@@ -1,5 +1,7 @@
 import polars as pl
 from typing import Literal
+from itertools import zip_longest
+
 import logging
 logging.basicConfig(level=logging.DEBUG,
     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -75,16 +77,18 @@ class PopularityRanker(_BaseRanker):
 class TopicRanker(_BaseRanker):
     def __init__(self, 
             returnformat: Literal["id","dicts","dataframe"],
-            metric: Literal['quote_count',  'reply_count',  'repost_count'], 
-            method: Literal['networkclustering', 'bert']):
+            method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbertf'],
+            metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement'):
         self.required_keys = {'cid', 'indexed_at', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
+        if metric != 'engagement':
+            raise NotImplementedError
         self.metric = metric
         self.method = method
     
     def _cluster(self, data: pl.DataFrame, threshold = .2, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
         """This function clusters the texts using the Leiden Algorithm by Traag, Waltman, & Van Eck (2019),
-        following the approach Trilling & Van Hoof (2020) suggest news event clustering.
+        See also suggestions by Trilling & Van Hoof (2020) for  news event clustering.
         It adds a column "cluster" and a column "clustersize" to the dataframe.
         """
         logging.debug("Creating cosine similarity matrix...")
@@ -143,13 +147,47 @@ class TopicRanker(_BaseRanker):
                 logger.warning(f"Consider using another method, or submitting less document")
             df_with_clusters = self._cluster(df, similarity='sbert-cosine')
               
-        # TODO The ranking is now very simplistic, we simply rank by cluster size
-        # TODO Hence, the most popular topic gets more popular.
-        # TODO Implement more sophisticated algo
+        # OPTION 1
+        # This here would be a very simplistic ranking, we simply rank by cluster size
+        # Hence, the most published about topic gets more popular.
+        # df_with_clusters = df_with_clusters.sort(by='clustersize', descending=True)
+        # return self._transform_output(df_with_clusters)
 
-        df_with_clusters.sort(by='clustersize', descending=True)
+        # OPTION2
+        # But we do sth more fancy:
+        # We now return the articles sorted by the cluster engagement rank
 
-        return self._transform_output(df_with_clusters)
+        clusterstats = df_with_clusters.group_by('cluster').agg(pl.col('like_count').sum(), 
+            pl.col('reply_count').sum(),
+            pl.col('quote_count').sum(),
+            pl.col('repost_count').sum())
+        # TODO: MAYBE WEIGH THIS, SUCH THAT A LIKE COUNTS LESS THAN A REPLY?
+        clusterstats = clusterstats.with_columns(sum=pl.sum_horizontal("reply_count", "like_count",'repost_count','quote_count'))
+        clusterstats = clusterstats.with_columns(engagement_rank=clusterstats["sum"].rank(method='random', descending=True)).rename({'sum':'engagement_count'})
+        clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({"cluster_cluster": "cluster"})
+        df_with_clusters = df_with_clusters.join(clusterstats, on="cluster")
+        
+        df_with_clusters = df_with_clusters.sort(by='cluster_engagement_rank')
+        
+        # TODO: Implement saturation here, such that we do not have just the same things from the same cluster
+        # TODO: (iteratively construct feed accounting for a topic saturation penalty (if post is already covered; see example below).)
+
+        #a = ['a1','a2']
+        #b = ['b1','b2','b3']
+        #c = ['c1']
+        # [item for cluster in zip_longest(a,b,c) for item in cluster if item is not None]
+        # gives: ['a1', 'b1', 'c1', 'a2', 'b2', 'b3']
+
+        # AND NOW THIS FOR OUR DATA
+        # We take the first article from the most-engaged cluster, then the first article from the second-most-engaged-cluster, then from the third, etc.
+        # If we exausted, we start from the beginning
+        # If a cluster is exausted, we just skip it
+        # (see toy example abouve)
+        list_of_clusters_gen = (cluster.rows(named=True)  for _, cluster in df_with_clusters.group_by('cluster_engagement_rank', maintain_order=True))
+        fancyranking = [item for cluster in zip_longest(*list_of_clusters_gen) for item in cluster if item is not None]
+        final_ranking = pl.DataFrame(fancyranking)
+
+        return self._transform_output(final_ranking)
 
 
 def sampledata(filename="example_news.csv"):
@@ -165,8 +203,8 @@ if __name__=="__main__":
     data = sampledata()
     #ranker = TrivialRanker(returnformat='id')
     #ranker2 = PopularityRanker(returnformat='dicts', metric= "reply_count")
-    ranker3 = TopicRanker(returnformat='dataframe', metric= None, method = 'networkclustering-tfidf')
-    ranker4 = TopicRanker(returnformat='dataframe', metric= None, method = 'networkclustering-sbert')
+    ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf')
+    ranker4 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
 
     #print(ranker.rank(data)[:10])
     #print(ranker2.rank(data)[:10])
