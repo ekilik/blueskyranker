@@ -207,3 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 .vscode/
+
+
+# PHILIPP
+archive/
+.DS_Store
