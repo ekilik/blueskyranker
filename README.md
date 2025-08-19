@@ -42,8 +42,7 @@ ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sber
 
 
 ## Demo of the whole pipeline
-1. Fetch post and engagement data (by running `./fetch_bsky_auth-r_feeds_progress.py`)
-2. Play with the rankings in `example.ipynb`
+Check out  `example.ipynb` to see how we first download the data and then rank it!
 
 
 ## Detailed Documentation

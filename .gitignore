@@ -212,3 +212,6 @@ __marimo__/
 # PHILIPP
 archive/
 .DS_Store
+
+# seems unlikely we ever want to commit the data 
+.csv
