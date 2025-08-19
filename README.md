@@ -17,7 +17,7 @@ from blueskyranker.ranker import TrivialRanker
 
 ranker = Trivialranker(returnformat='id')
 
-rankedposts = rankder.rank(data)
+rankedposts = ranker.rank(data)
 ```
 Here, `data` is either a polars dataframe or a list of dicts with the Bluesky-posts you want to rank.
 
@@ -40,6 +40,11 @@ ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-coun
 ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
 ```
 
+If you then want to post the ranked posts to a server, you can --- after having called `.rank()` simply call `.post()`:
+```
+ranker3.post(test=False)
+```
+**For this to work, you need to edit the file `blueskyranker/.env` in and add the server address (without https://) and the API-key. **
 
 ## Demo of the whole pipeline
 Check out  `example.ipynb` to see how we first download the data and then rank it!

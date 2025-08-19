@@ -4,3 +4,4 @@ leidenalg
 igraph
 tqdm
 atproto
+dotenv

@@ -2,6 +2,11 @@
 import polars as pl
 from typing import Literal
 from itertools import zip_longest
+from dotenv import load_dotenv
+import os
+import requests
+
+
 
 import logging
 logger = logging.getLogger('BSRlog')
@@ -18,6 +23,7 @@ import numpy as np
 import igraph as ig
 import leidenalg
 
+load_dotenv(".env")
 
 
 class _BaseRanker():
@@ -26,6 +32,7 @@ class _BaseRanker():
         self.returnformat = returnformat
         self.metric = metric
         self.descending = descending  # True: 1=highest rank, False: 1=lowest rank
+        self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
 
     def _transform_input(self, data) -> pl.DataFrame:
         """not fully implemented yet, ensure that we can process dataframes but also list of dicts """
@@ -41,8 +48,11 @@ class _BaseRanker():
             raise ValueError("Data format not supported")
 
     def _transform_output(self, data):
+        if not self.descending:
+            data = data.reverse()  # The lower in the table, the more important in this case
+
         if self.returnformat == 'id':
-            return data['cid'].to_list()
+            return data['uri'].to_list()
         elif self.returnformat == "dicts":
             return data.to_dicts()
         elif self.returnformat == "dataframe":
@@ -54,27 +64,50 @@ class _BaseRanker():
         """The rank method takes a set of bluesky posts (as list of dicts), and returns them in a ranked order.
         Overwrite this method with a function that implements your ranking algorithm"""
         # TODO: Determine wether only the ID or the whole ranking should be returned
+        self.ranking = None  
         raise NotImplementedError
+        
 
+    def post(self, test = True,):
+        """Send the ranking to the server that generates new feeds
+        Essentially a port of https://github.com/JBGruber/newsflows-bsky-feed-generator/blob/main/scripts/prioritise.r
+        
+        Parameters:
+        test (bool): If True, only does a test run without changing the database
+        """
+        server = f"https://{os.getenv('FEEDGEN_HOSTNAME', 'localhost:3020')}"
+        headers = {"api-key": os.getenv("PRIORITIZE_API_KEY")}
+        params = {"test": str(test).lower()}
+
+        post_list = self.ranking [['uri']].with_row_index().rename({'index':'priority'}).rows(named=True)
+        logger.debug(f"Sending this post_list:\n{post_list}")
+        resp = requests.post(f"{server}/api/prioritize", headers=headers, params=params, json=post_list)
+        logger.info(resp)
+        logger.info(resp.text)
+
+        
 
 class TrivialRanker(_BaseRanker):
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """This ranker just keeps the order of the input"""
         df = self._transform_input(data)
+        self.ranking = df
         return self._transform_output(df)
 
 
 class PopularityRanker(_BaseRanker):
     def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count'], descending: bool ):
-        self.required_keys = {'cid', 'like_count', 'quote_count',  'reply_count',  'repost_count'} 
+        self.required_keys = {'uri', 'cid', 'like_count', 'quote_count',  'reply_count',  'repost_count'} 
         self.returnformat = returnformat
         self.metric = metric
         self.descending = descending
+        self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
+
 
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
-        """This ranker just keeps the order of the input"""
         df = self._transform_input(data)
         df.sort(by=self.metric, descending=self.descending)
+        self.ranking = df
         return self._transform_output(df)
 
 
@@ -84,13 +117,15 @@ class TopicRanker(_BaseRanker):
             method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbertf'],
             descending: bool,
             metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement'):
-        self.required_keys = {'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
+        self.required_keys = {'uri', 'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
         if metric != 'engagement':
             raise NotImplementedError
         self.metric = metric
         self.method = method
         self.descending = descending
+        self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
+
     
     def _cluster(self, data: pl.DataFrame, threshold = .2, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
         """This function clusters the texts using the Leiden Algorithm by Traag, Waltman, & Van Eck (2019),
@@ -199,7 +234,7 @@ class TopicRanker(_BaseRanker):
         list_of_clusters_gen = (cluster.rows(named=True)  for _, cluster in df_with_clusters.group_by('cluster_engagement_rank', maintain_order=True))
         fancyranking = [item for cluster in zip_longest(*list_of_clusters_gen) for item in cluster if item is not None]
         final_ranking = pl.DataFrame(fancyranking)
-
+        self.ranking = final_ranking
         return self._transform_output(final_ranking)
 
 
@@ -219,7 +254,7 @@ if __name__=="__main__":
     ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=True)
     #ranker4 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
 
-    #print(ranker.rank(data)[:10])
+    print(ranker.rank(data)[:10])
     #print(ranker2.rank(data)[:10])
     # SBERT IS TOO SLOW TO RUN ON 1000 DOCS, we only do less
     #print(ranker4.rank(data[:40])[:10])
@@ -232,7 +267,9 @@ if __name__=="__main__":
 
     ranker3_reverse = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=False)
     ranking = ranker3_reverse.rank(data)
-    print(ranking[:10])
+    print(ranking[-10:]) # show LAST 10 in this case
+
+    ranker3.post()
 
 
 
