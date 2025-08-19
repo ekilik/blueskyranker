@@ -51,6 +51,15 @@ from collections import defaultdict
 from atproto import Client, models
 from tqdm import tqdm
 
+import logging
+
+logger = logging.getLogger('BSRlog')
+logging.basicConfig(
+    format='%(asctime)s %(levelname)-8s %(message)s',
+    #datefmt='%Y-%m-%d %H:%M:%S')
+    datefmt='%H:%M:%S')
+logger.setLevel(logging.DEBUG)
+
 APPVIEW_XRPC = "https://public.api.bsky.app/xrpc"
 PAGE_LIMIT = 100
 SLEEP_SEC = 0.20  # polite pacing
@@ -334,8 +343,9 @@ def fetch_author_feed_all(
     }
     return rows, stats
 
-def print_final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
+def final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
     # Aggregate totals
+    lines = []
     grand = defaultdict(float)
     for s in per_handle_stats:
         for k, v in s.items():
@@ -344,50 +354,52 @@ def print_final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
             if isinstance(v, (int, float)):
                 grand[k] += v
 
-    print("\n" + "="*72)
-    print("FINAL REPORT")
-    print("="*72)
+    lines.append("\n" + "="*72)
+    lines.append("FINAL REPORT")
+    lines.append("="*72)
     for s in per_handle_stats:
-        print(f"\nHandle: {s['handle']}")
-        print(f"  Pages fetched         : {s['pages']}")
-        print(f"  Posts fetched         : {s['posts']}")
-        print(f"    - originals         : {s['originals']}")
-        print(f"    - replies           : {s['replies']}")
-        print(f"    - reposts           : {s['reposts']}")
-        print(f"  Engagement (sums)")
-        print(f"    - likes             : {s['sum_likes']}")
-        print(f"    - reposts           : {s['sum_reposts']}")
-        print(f"    - replies           : {s['sum_replies']}")
-        print(f"    - quotes            : {s['sum_quotes']}")
-        print(f"  Engagement (averages per post)")
-        print(f"    - likes             : {s['avg_likes']:.2f}")
-        print(f"    - reposts           : {s['avg_reposts']:.2f}")
-        print(f"    - replies           : {s['avg_replies']:.2f}")
-        print(f"    - quotes            : {s['avg_quotes']:.2f}")
-        print(f"  Time range            : {s['first_post']}  →  {s['last_post']}")
-        print(f"  Time taken            : {s['elapsed_sec']:.2f}s")
-        print(f"  Effective rate        : {s['rate_posts_per_sec']:.2f} posts/sec")
+        lines.append(f"\nHandle: {s['handle']}")
+        lines.append(f"  Pages fetched         : {s['pages']}")
+        lines.append(f"  Posts fetched         : {s['posts']}")
+        lines.append(f"    - originals         : {s['originals']}")
+        lines.append(f"    - replies           : {s['replies']}")
+        lines.append(f"    - reposts           : {s['reposts']}")
+        lines.append(f"  Engagement (sums)")
+        lines.append(f"    - likes             : {s['sum_likes']}")
+        lines.append(f"    - reposts           : {s['sum_reposts']}")
+        lines.append(f"    - replies           : {s['sum_replies']}")
+        lines.append(f"    - quotes            : {s['sum_quotes']}")
+        lines.append(f"  Engagement (averages per post)")
+        lines.append(f"    - likes             : {s['avg_likes']:.2f}")
+        lines.append(f"    - reposts           : {s['avg_reposts']:.2f}")
+        lines.append(f"    - replies           : {s['avg_replies']:.2f}")
+        lines.append(f"    - quotes            : {s['avg_quotes']:.2f}")
+        lines.append(f"  Time range            : {s['first_post']}  →  {s['last_post']}")
+        lines.append(f"  Time taken            : {s['elapsed_sec']:.2f}s")
+        lines.append(f"  Effective rate        : {s['rate_posts_per_sec']:.2f} posts/sec")
 
     total_posts = int(grand["posts"])
-    print("\n" + "-"*72)
-    print("All handles combined")
-    print("-"*72)
-    print(f"  Total pages           : {int(grand['pages'])}")
-    print(f"  Total posts           : {total_posts}")
-    print(f"    - originals         : {int(grand['originals'])}")
-    print(f"    - replies           : {int(grand['replies'])}")
-    print(f"    - reposts           : {int(grand['reposts'])}")
-    print(f"  Engagement (sums)")
-    print(f"    - likes             : {int(grand['sum_likes'])}")
-    print(f"    - reposts           : {int(grand['sum_reposts'])}")
-    print(f"    - replies           : {int(grand['sum_replies'])}")
-    print(f"    - quotes            : {int(grand['sum_quotes'])}")
+    lines.append("\n" + "-"*72)
+    lines.append("All handles combined")
+    lines.append("-"*72)
+    lines.append(f"  Total pages           : {int(grand['pages'])}")
+    lines.append(f"  Total posts           : {total_posts}")
+    lines.append(f"    - originals         : {int(grand['originals'])}")
+    lines.append(f"    - replies           : {int(grand['replies'])}")
+    lines.append(f"    - reposts           : {int(grand['reposts'])}")
+    lines.append(f"  Engagement (sums)")
+    lines.append(f"    - likes             : {int(grand['sum_likes'])}")
+    lines.append(f"    - reposts           : {int(grand['sum_reposts'])}")
+    lines.append(f"    - replies           : {int(grand['sum_replies'])}")
+    lines.append(f"    - quotes            : {int(grand['sum_quotes'])}")
     if total_posts:
-        print(f"  Engagement (averages per post)")
-        print(f"    - likes             : {grand['sum_likes']/total_posts:.2f}")
-        print(f"    - reposts           : {grand['sum_reposts']/total_posts:.2f}")
-        print(f"    - replies           : {grand['sum_replies']/total_posts:.2f}")
-        print(f"    - quotes            : {grand['sum_quotes']/total_posts:.2f}")
+        lines.append(f"  Engagement (averages per post)")
+        lines.append(f"    - likes             : {grand['sum_likes']/total_posts:.2f}")
+        lines.append(f"    - reposts           : {grand['sum_reposts']/total_posts:.2f}")
+        lines.append(f"    - replies           : {grand['sum_replies']/total_posts:.2f}")
+        lines.append(f"    - quotes            : {grand['sum_quotes']/total_posts:.2f}")
+    
+    return "\n".join(lines)
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, max-age cutoff, incremental updates, and embed extraction.")
@@ -505,13 +517,13 @@ def main():
     combined_to_append = [r for r in combined_new_rows if r["uri"] not in existing_combined_uris]
     append_rows(combined_path, combined_to_append)
 
-    print(
+    logger.debug(
         f"\nWrote/updated combined CSV with +{len(combined_to_append)} new rows → {combined_path} "
         f"({elapsed_all:.2f}s total)."
     )
 
     # Final detailed report for the run (scraped rows prior to de-dup)
-    print_final_report(per_handle_stats)
+    logger.info(final_report(per_handle_stats))
 
 if __name__ == "__main__":
     main()

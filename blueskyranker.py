@@ -4,11 +4,12 @@ from typing import Literal
 from itertools import zip_longest
 
 import logging
-logging.basicConfig(level=logging.DEBUG,
+logger = logging.getLogger('BSRlog')
+logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
     #datefmt='%Y-%m-%d %H:%M:%S')
     datefmt='%H:%M:%S')
-
+logger.setLevel(logging.DEBUG)
 
 # for topic ranker:
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer  
@@ -92,7 +93,7 @@ class TopicRanker(_BaseRanker):
         See also suggestions by Trilling & Van Hoof (2020) for  news event clustering.
         It adds a column "cluster" and a column "clustersize" to the dataframe.
         """
-        logging.debug("Creating cosine similarity matrix...")
+        logger.debug("Creating cosine similarity matrix...")
         if similarity =='tfidf-cosine':
             vectorizer = TfidfVectorizer()   
             bow = vectorizer.fit_transform(data['text'])
@@ -110,21 +111,21 @@ class TopicRanker(_BaseRanker):
         else:
             raise NotImplementedError(f"Simiarity {similarity} is not implemented")
 
-        logging.debug(f"Removing all entries below a threshold of {threshold}")
+        logger.debug(f"Removing all entries below a threshold of {threshold}")
         filtered_matrix = np.where(sim_matrix >= threshold, sim_matrix, 0)
         sparsity = 1.0 -(np.count_nonzero(filtered_matrix) / float(filtered_matrix.size) )
-        logging.debug(f"The new matrix is {sparsity:.2%} sparse")
-        logging.debug("Creating a graph")
+        logger.debug(f"The new matrix is {sparsity:.2%} sparse")
+        logger.debug("Creating a graph")
         g = ig.Graph.Weighted_Adjacency(filtered_matrix.tolist(), mode="UNDIRECTED", attr="weight")
         g.vs["cid"] = data['cid']
-        logging.debug("Apply network clustering using the Leiden Algorithm")
+        logger.debug("Apply network clustering using the Leiden Algorithm")
         # The Surprise didn't work too well on these data, resort to Modularity:
         # part = leidenalg.find_partition(g, leidenalg.SurpriseVertexPartition, weights='weight')
         part = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, weights='weight')
         partitions = []
         for subgraph in part.subgraphs():
             partitions.append([node['cid'] for node in subgraph.vs])
-        logging.debug(f"The {len(data)} items were grouped into {len(partitions)} clusters.")
+        logger.debug(f"The {len(data)} items were grouped into {len(partitions)} clusters.")
 
         clusterassignment = [[article, cluster] for cluster, articles in enumerate(partitions) for article in articles]
         clusterassignment_df = pl.DataFrame(clusterassignment,orient='row', schema=["cid","cluster"])
