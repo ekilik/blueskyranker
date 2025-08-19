@@ -21,10 +21,11 @@ import leidenalg
 
 
 class _BaseRanker():
-    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric=None):
+    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric=None, descending = False):
         self.required_keys = None
         self.returnformat = returnformat
         self.metric = metric
+        self.descending = descending  # True: 1=highest rank, False: 1=lowest rank
 
     def _transform_input(self, data) -> pl.DataFrame:
         """not fully implemented yet, ensure that we can process dataframes but also list of dicts """
@@ -64,15 +65,16 @@ class TrivialRanker(_BaseRanker):
 
 
 class PopularityRanker(_BaseRanker):
-    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count'] ):
+    def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count'], descending: bool ):
         self.required_keys = {'cid', 'like_count', 'quote_count',  'reply_count',  'repost_count'} 
         self.returnformat = returnformat
         self.metric = metric
+        self.descending = descending
 
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """This ranker just keeps the order of the input"""
         df = self._transform_input(data)
-        df.sort(by=self.metric, descending=True)
+        df.sort(by=self.metric, descending=self.descending)
         return self._transform_output(df)
 
 
@@ -80,6 +82,7 @@ class TopicRanker(_BaseRanker):
     def __init__(self, 
             returnformat: Literal["id","dicts","dataframe"],
             method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbertf'],
+            descending: bool,
             metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement'):
         self.required_keys = {'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
@@ -87,6 +90,7 @@ class TopicRanker(_BaseRanker):
             raise NotImplementedError
         self.metric = metric
         self.method = method
+        self.descending = descending
     
     def _cluster(self, data: pl.DataFrame, threshold = .2, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
         """This function clusters the texts using the Leiden Algorithm by Traag, Waltman, & Van Eck (2019),
@@ -143,7 +147,7 @@ class TopicRanker(_BaseRanker):
             pl.len())
         # TODO: MAYBE WEIGH THIS, SUCH THAT A LIKE COUNTS LESS THAN A REPLY?
         clusterstats = clusterstats.with_columns(sum=pl.sum_horizontal("reply_count", "like_count",'repost_count','quote_count'))
-        clusterstats = clusterstats.with_columns(engagement_rank=clusterstats["sum"].rank(method='random', descending=True)).rename({'sum':'engagement_count', 'len':'size'})
+        clusterstats = clusterstats.with_columns(engagement_rank=clusterstats["sum"].rank(method='random', descending=self.descending)).rename({'sum':'engagement_count', 'len':'size'}) 
         clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({"cluster_cluster": "cluster"})
         df_with_clusters = df_with_clusters.join(clusterstats, on="cluster")
         return df_with_clusters
@@ -167,7 +171,7 @@ class TopicRanker(_BaseRanker):
         # OPTION 1
         # This here would be a very simplistic ranking, we simply rank by cluster size
         # Hence, the most published about topic gets more popular.
-        # df_with_clusters = df_with_clusters.sort(by='clustersize', descending=True)
+        # df_with_clusters = df_with_clusters.sort(by='clustersize', descending=self.descending)
         # return self._transform_output(df_with_clusters)
 
         # OPTION2
@@ -175,6 +179,8 @@ class TopicRanker(_BaseRanker):
         # We now return the articles sorted by the cluster engagement rank
 
         df_with_clusters = df_with_clusters.sort(by='cluster_engagement_rank')
+        if not self.descending:
+            df_with_clusters = df_with_clusters.reverse()
         
         # TODO: Implement saturation here, such that we do not have just the same things from the same cluster
         # TODO: (iteratively construct feed accounting for a topic saturation penalty (if post is already covered; see example below).)
@@ -199,7 +205,7 @@ class TopicRanker(_BaseRanker):
 
 def sampledata(filename="example_news.csv"):
     """provides sample data for offline testing"""
-    data = pl.read_csfv(filename).to_dicts()
+    data = pl.read_csv(filename).to_dicts()
     return data
 
 
@@ -208,9 +214,9 @@ def sampledata(filename="example_news.csv"):
 if __name__=="__main__":
     print("Testing the bluesky ranker...")
     data = sampledata()
-    #ranker = TrivialRanker(returnformat='id')
+    ranker = TrivialRanker(returnformat='id', descending=True)
     #ranker2 = PopularityRanker(returnformat='dicts', metric= "reply_count")
-    ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf')
+    ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=True)
     #ranker4 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
 
     #print(ranker.rank(data)[:10])
@@ -222,6 +228,10 @@ if __name__=="__main__":
     print("Printing the results in the chosen format (dataframe (full dataframe), dicts (list of dicts for generic use), or id only (for just sending the ID to a server)")
     print("Printing only the first 10 items")
     print()
+    print(ranking[:10])
+
+    ranker3_reverse = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=False)
+    ranking = ranker3_reverse.rank(data)
     print(ranking[:10])
 
 
