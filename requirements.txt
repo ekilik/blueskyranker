@@ -2,3 +2,5 @@ polars
 scikit-learn
 leidenalg
 igraph
+tqdm
+atproto

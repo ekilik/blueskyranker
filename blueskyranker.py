@@ -29,7 +29,7 @@ class _BaseRanker():
         """not fully implemented yet, ensure that we can process dataframes but also list of dicts """
         if type(data) is list:
             if self.required_keys is not None:
-                assert self.required_keys.issubset(data[0].keys()) 
+                assert self.required_keys.issubset(data[0].keys()), f"Not all required keys ({self.required_keys} are in the dataset (present keys: {data[0].keys()}). Missing keys: {set(self.required_keys) - set(data[0].keys())}" 
             return pl.from_dicts(data)
         elif type(data) is pl.DataFrame:
             if self.required_keys is not None:
@@ -80,7 +80,7 @@ class TopicRanker(_BaseRanker):
             returnformat: Literal["id","dicts","dataframe"],
             method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbertf'],
             metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement'):
-        self.required_keys = {'cid', 'indexed_at', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
+        self.required_keys = {'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
         if metric != 'engagement':
             raise NotImplementedError
@@ -198,7 +198,7 @@ class TopicRanker(_BaseRanker):
 
 def sampledata(filename="example_news.csv"):
     """provides sample data for offline testing"""
-    data = pl.read_csv(filename).to_dicts()
+    data = pl.read_csfv(filename).to_dicts()
     return data
 
 

@@ -38,7 +38,12 @@ ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfid
 ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count')
 # the following one is very slow and not recommended unless you have a GPU or very few documents
 ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
+```
 
+
+## Demo of the whole pipeline
+1. Fetch post and engagement data (by running `./fetch_bsky_auth-r_feeds_progress.py`)
+2. Play with the rankings in `example.ipynb`
 
 
 ## Detailed Documentation
