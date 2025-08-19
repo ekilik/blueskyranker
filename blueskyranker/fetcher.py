@@ -401,6 +401,112 @@ def final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
     
     return "\n".join(lines)
 
+
+
+
+class Fetcher():
+    """Fetcher to get public Bluesky posts with max-age cutoff, incremental updates, and embed extraction."""
+    def __init__(self, xrpc_base=APPVIEW_XRPC):
+        self.client = Client(xrpc_base)
+
+    def fetch(self, handles=[
+            "news-flows-nl.bsky.social",
+            "news-flows-ir.bsky.social",
+            "news-flows-cz.bsky.social",
+            "news-flows-fr.bsky.social",
+        ],
+        max_age_days=7,
+        cutoff_check_every=1,
+        include_pins=False):
+        """Fetch public Bluesky posts.
+
+        Parameters:
+
+        handles (list of strings): Bluesky handles to fetch
+        max_age_days (int): Only keep posts whose createdAt is within the last N days; pagination stops early when older content is reached.
+        cutoff_check_every (int)": How many pages between early-stop checks against the cutoff (default: 1 = check every page).
+        include_pins (bool): Include pinned posts at the top
+        """
+
+        posts_pbar = tqdm(desc="Posts fetched (all handles)", unit="post", dynamic_ncols=True)
+        combined_new_rows: List[Dict[str, Any]] = []
+        per_handle_stats: List[Dict[str, Any]] = []
+
+        handles_pbar = tqdm(handles, desc="Handles", unit="handle", dynamic_ncols=True)
+        start_all = time.perf_counter()
+
+        for handle in handles_pbar:
+            out_path = f"{handle.replace('.', '_')}_author_feed.csv"
+
+            # Ensure header exists before reading
+            _ = ensure_headers(out_path)
+
+            # Incremental cutoff per handle:
+            # Use later of (now - N days) and latest saved createdAt in CSV (if present).
+            cutoff_dt: Optional[datetime] = None
+            if max_age_days is not None:
+                rel_cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+                latest_saved = latest_created_at_in_csv(out_path)
+                cutoff_dt = max(latest_saved, rel_cutoff) if latest_saved else rel_cutoff
+
+            # Fetch rows for the handle
+            handle_rows, stats = fetch_author_feed_all(
+                client=self.client,
+                actor=handle,
+                posts_pbar=posts_pbar,
+                include_pins=include_pins,
+                cutoff_dt=cutoff_dt,
+                cutoff_check_every=cutoff_check_every,
+            )
+
+            # Prepare append with de-dup
+            existing_uris = load_existing_uris(out_path)
+            new_rows = [r for r in handle_rows if r.get("uri") and r["uri"] not in existing_uris]
+
+            # Append only new rows
+            append_rows(out_path, new_rows)
+
+            # Track combined (only newly added this run)
+            combined_new_rows.extend(new_rows)
+
+            # Report: how many NEW and their time frame
+            if new_rows:
+                dts = [iso_to_dt(r.get("createdAt")) for r in new_rows if r.get("createdAt")]
+                dts = [d for d in dts if d is not None]
+                new_min = min(dts).isoformat() if dts else None
+                new_max = max(dts).isoformat() if dts else None
+                handles_pbar.write(
+                    f"✅ DONE {handle}: added {len(new_rows)} new posts "
+                    f"({new_min} → {new_max}) → {out_path}"
+                )
+            else:
+                handles_pbar.write(
+                    f"✅ DONE {handle}: no new posts to append → {out_path}"
+                )
+
+            # Keep scrape stats (before de-dup)
+            per_handle_stats.append(stats)
+
+        elapsed_all = time.perf_counter() - start_all
+        posts_pbar.close()
+
+        # Combined CSV: append only newly added rows across all handles in this run.
+        combined_path = "all_handles_author_feed.csv"
+        ensure_headers(combined_path)
+        existing_combined_uris = load_existing_uris(combined_path)
+        combined_to_append = [r for r in combined_new_rows if r["uri"] not in existing_combined_uris]
+        append_rows(combined_path, combined_to_append)
+
+        logger.debug(
+            f"\nWrote/updated combined CSV with +{len(combined_to_append)} new rows → {combined_path} "
+            f"({elapsed_all:.2f}s total)."
+        )
+
+        # Final detailed report for the run (scraped rows prior to de-dup)
+        return final_report(per_handle_stats)
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, max-age cutoff, incremental updates, and embed extraction.")
     parser.add_argument(
@@ -446,84 +552,11 @@ def main():
     parser.set_defaults(include_pins=False)
     args = parser.parse_args()
 
-    client = Client(args.xrpc_base)
+    fetcher = Fetcher(args.xrpc_base)
+    results = fetcher.fetch(handles = args.handles, max_age_days=args.max_age_days, cutoff_check_every=args.cutoff_check_every, include_pins=args.include_pins)
+    print(results)
 
-    posts_pbar = tqdm(desc="Posts fetched (all handles)", unit="post", dynamic_ncols=True)
-    combined_new_rows: List[Dict[str, Any]] = []
-    per_handle_stats: List[Dict[str, Any]] = []
-
-    handles_pbar = tqdm(args.handles, desc="Handles", unit="handle", dynamic_ncols=True)
-    start_all = time.perf_counter()
-
-    for handle in handles_pbar:
-        out_path = f"{handle.replace('.', '_')}_author_feed.csv"
-
-        # Ensure header exists before reading
-        _ = ensure_headers(out_path)
-
-        # Incremental cutoff per handle:
-        # Use later of (now - N days) and latest saved createdAt in CSV (if present).
-        cutoff_dt: Optional[datetime] = None
-        if args.max_age_days is not None:
-            rel_cutoff = datetime.now(timezone.utc) - timedelta(days=args.max_age_days)
-            latest_saved = latest_created_at_in_csv(out_path)
-            cutoff_dt = max(latest_saved, rel_cutoff) if latest_saved else rel_cutoff
-
-        # Fetch rows for the handle
-        handle_rows, stats = fetch_author_feed_all(
-            client=client,
-            actor=handle,
-            posts_pbar=posts_pbar,
-            include_pins=args.include_pins,
-            cutoff_dt=cutoff_dt,
-            cutoff_check_every=args.cutoff_check_every,
-        )
-
-        # Prepare append with de-dup
-        existing_uris = load_existing_uris(out_path)
-        new_rows = [r for r in handle_rows if r.get("uri") and r["uri"] not in existing_uris]
-
-        # Append only new rows
-        append_rows(out_path, new_rows)
-
-        # Track combined (only newly added this run)
-        combined_new_rows.extend(new_rows)
-
-        # Report: how many NEW and their time frame
-        if new_rows:
-            dts = [iso_to_dt(r.get("createdAt")) for r in new_rows if r.get("createdAt")]
-            dts = [d for d in dts if d is not None]
-            new_min = min(dts).isoformat() if dts else None
-            new_max = max(dts).isoformat() if dts else None
-            handles_pbar.write(
-                f"✅ DONE {handle}: added {len(new_rows)} new posts "
-                f"({new_min} → {new_max}) → {out_path}"
-            )
-        else:
-            handles_pbar.write(
-                f"✅ DONE {handle}: no new posts to append → {out_path}"
-            )
-
-        # Keep scrape stats (before de-dup)
-        per_handle_stats.append(stats)
-
-    elapsed_all = time.perf_counter() - start_all
-    posts_pbar.close()
-
-    # Combined CSV: append only newly added rows across all handles in this run.
-    combined_path = "all_handles_author_feed.csv"
-    ensure_headers(combined_path)
-    existing_combined_uris = load_existing_uris(combined_path)
-    combined_to_append = [r for r in combined_new_rows if r["uri"] not in existing_combined_uris]
-    append_rows(combined_path, combined_to_append)
-
-    logger.debug(
-        f"\nWrote/updated combined CSV with +{len(combined_to_append)} new rows → {combined_path} "
-        f"({elapsed_all:.2f}s total)."
-    )
-
-    # Final detailed report for the run (scraped rows prior to de-dup)
-    logger.info(final_report(per_handle_stats))
+   
 
 if __name__ == "__main__":
     main()
