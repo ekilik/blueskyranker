@@ -13,7 +13,7 @@ Just run `python3 blueskyranker.py` for a demo
 ### Using it in your own script
 Let's first run a simple ranker that, in fact, doesn't rank but just returns the output
 ```
-from blueskyranker import TrivialRanker
+from blueskyranker.ranker import TrivialRanker
 
 ranker = Trivialranker(returnformat='id')
 
@@ -25,14 +25,14 @@ This ranker is set up such that it just returns the ids of the ranked posts. Alt
 
 You can also rank by popularity:
 ```
-from blueskyranker imort PopularityRanker
+from blueskyranker.ranker imort PopularityRanker
 ranker = PopularityRanker(returnformat='dicts', metric= "reply_count")  # you can also select metrics like "like_count" etc.
 ```
 
 Finally, and most importantly, you can implement much more advanced rankers, like this one, that clusters all posts, and then ranks posts such that posts from much-engaged clusters (!) are ranked higher. (DETAILED DESCRIPTION TO FOLLOW)
 
 ```
-from blueskyranker import TopicRanker
+from blueskyranker.ranker import TopicRanker
     
 ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf')
 ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count')

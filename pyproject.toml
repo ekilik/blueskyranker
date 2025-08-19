@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "NEWSFLOWS Bluesky Feed Ranker"
+version = "0.0.1"
+authors = [
+  { name="Damian Trilling", email="d.c.trilling@vu.nl" },
+  { name="Philipp Mendoza", email="p.m.mendoza@vu.nl" },
+]
+description = "A ranker for bluesky feeds within the NEWSFLOWS project"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+[project.urls]
+Homepage = "https://github.com/damian0604/blueskyranker"
+Issues = "https://github.com/damian0604/blueskyranker/issues"
