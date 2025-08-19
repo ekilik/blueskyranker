@@ -79,11 +79,19 @@ class _BaseRanker():
         headers = {"api-key": os.getenv("PRIORITIZE_API_KEY")}
         params = {"test": str(test).lower()}
 
+        assert self.ranking is not None, "You need to call .rank() first to rank the posts before you can post them"
+        
         post_list = self.ranking [['uri']].with_row_index().rename({'index':'priority'}).rows(named=True)
         logger.debug(f"Sending this post_list:\n{post_list}")
         resp = requests.post(f"{server}/api/prioritize", headers=headers, params=params, json=post_list)
-        logger.info(resp)
-        logger.info(resp.text)
+        if resp.status_code==200:
+            logger.debug(resp)
+            logger.debug(resp.text)
+            return True
+        else:
+            logger.error(resp)
+            logger.error(resp.text)
+            return False
 
         
 
