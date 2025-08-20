@@ -38,11 +38,11 @@ class _BaseRanker():
         """not fully implemented yet, ensure that we can process dataframes but also list of dicts """
         if type(data) is list:
             if self.required_keys is not None:
-                assert self.required_keys.issubset(data[0].keys()), f"Not all required keys ({self.required_keys} are in the dataset (present keys: {data[0].keys()}). Missing keys: {set(self.required_keys) - set(data[0].keys())}" 
+                assert self.required_keys.issubset(data[0].columns), f"Not all required keys ({self.required_keys} are in the dataset (present keys: {data[0].columns}). Missing keys: {set(self.required_keys) - set(data[0].keys())}" 
             return pl.from_dicts(data)
         elif type(data) is pl.DataFrame:
             if self.required_keys is not None:
-                assert self.required_keys.issubset(data.keys()) 
+                assert self.required_keys.issubset(data.columns) , f"Not all required keys ({self.required_keys} are in the dataset (present keys: {data.columns}). Missing keys: {set(self.required_keys) - set(data.keys())}"
             return data
         else:
             raise ValueError("Data format not supported")

@@ -8,12 +8,12 @@ Idea: take a list of bluesky posts and re-rank them.
 ## Usage
 
 ### Try it out!
-Just run `python3 blueskyranker.py` for a demo
+Just run `python3 blueskyranker/ranker.py` for a demo
 
 ### Using it in your own script
 Let's first run a simple ranker that, in fact, doesn't rank but just returns the output
 ```
-from blueskyranker.ranker import TrivialRanker
+from blueskyranker import TrivialRanker
 
 ranker = Trivialranker(returnformat='id')
 
@@ -25,19 +25,21 @@ This ranker is set up such that it just returns the ids of the ranked posts. Alt
 
 You can also rank by popularity:
 ```
-from blueskyranker.ranker imort PopularityRanker
+from blueskyranker import PopularityRanker
 ranker = PopularityRanker(returnformat='dicts', metric= "reply_count")  # you can also select metrics like "like_count" etc.
 ```
 
 Finally, and most importantly, you can implement much more advanced rankers, like this one, that clusters all posts, and then ranks posts such that posts from much-engaged clusters (!) are ranked higher. (DETAILED DESCRIPTION TO FOLLOW)
 
+We use descending=False to be compatible with the prioritzie-Endpoint to which we want to posts, which expectes *higher* numbers to get more priority.
+
 ```
-from blueskyranker.ranker import TopicRanker
+from blueskyranker import TopicRanker
     
-ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf')
-ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count')
+ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=False)
+ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count', descending=False)
 # the following one is very slow and not recommended unless you have a GPU or very few documents
-ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert')
+ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert', descending=False)
 ```
 
 If you then want to post the ranked posts to a server, you can --- after having called `.rank()` simply call `.post()`:
