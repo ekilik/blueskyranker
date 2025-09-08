@@ -87,6 +87,35 @@ print(paths)
 
 This writes per-handle CSVs like `news-flows-nl_bsky_social_author_feed.csv` and a combined CSV `all_handles_author_feed.csv`.
 
+### Load posts from SQLite into Polars
+You can work directly from the database without exporting to CSV:
+
+```
+import polars as pl
+from blueskyranker.fetcher import ensure_db, load_posts_df
+
+conn = ensure_db('newsflows.db')
+df_nl = load_posts_df(conn, handle='news-flows-nl.bsky.social', limit=2000, order_by='createdAt', descending=False)
+print(df_nl.head())
+```
+
+### Migrate existing CSVs into SQLite
+If you have older CSVs from previous runs, you can import them into the database (upsert by `uri`) to keep history and let future runs refresh engagement counts:
+
+```
+from blueskyranker.fetcher import ensure_db, import_csvs_to_db
+
+conn = ensure_db('newsflows.db')
+csvs = [
+  'news-flows-nl_bsky_social_author_feed.csv',
+  'news-flows-ir_bsky_social_author_feed.csv',
+  'news-flows-cz_bsky_social_author_feed.csv',
+  'news-flows-fr_bsky_social_author_feed.csv',
+]
+rows = import_csvs_to_db(conn, csvs)
+print(f"Imported {rows} rows from CSVs into SQLite")
+```
+
 ## Demo of the whole pipeline
 Check out  `example.ipynb` to see how we first download the data and then rank it!
 

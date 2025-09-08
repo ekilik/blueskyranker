@@ -45,6 +45,7 @@ import os
 import argparse
 import time
 import sqlite3
+import glob
 from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -159,6 +160,52 @@ def export_db_to_csv(conn: sqlite3.Connection, output_dir: str = ".", include_co
                 w.writerow(row)
         out_paths.append(cpath)
     return out_paths
+
+
+def import_csvs_to_db(conn: sqlite3.Connection, csv_paths: List[str]) -> int:
+    """Import existing per-handle CSVs into SQLite (upsert by uri).
+
+    Returns number of rows processed across all CSVs.
+    """
+    total = 0
+    for path in csv_paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            batch: List[Dict[str, Any]] = []
+            for row in reader:
+                batch.append({h: row.get(h) for h in CSV_HEADERS})
+                if len(batch) >= 1000:
+                    upsert_rows(conn, batch)
+                    total += len(batch)
+                    batch = []
+            if batch:
+                upsert_rows(conn, batch)
+                total += len(batch)
+    return total
+
+
+def load_posts_df(conn: sqlite3.Connection, handle: Optional[str] = None, limit: Optional[int] = None,
+                  order_by: str = "createdAt", descending: bool = False):
+    """Return posts as a Polars DataFrame, optionally filtered by handle.
+
+    Example: df = load_posts_df(conn, handle='news-flows-nl.bsky.social', limit=1000)
+    """
+    import polars as pl
+    where = []
+    args: List[Any] = []
+    if handle:
+        where.append("author_handle = ?")
+        args.append(handle)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    order_sql = f" ORDER BY {order_by} {'DESC' if descending else 'ASC'}"
+    limit_sql = f" LIMIT {int(limit)}" if limit else ""
+    sql = f"SELECT {', '.join(CSV_HEADERS)} FROM posts{where_sql}{order_sql}{limit_sql}"
+    cur = conn.execute(sql, args)
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return pl.from_dicts(rows)
 
 def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
