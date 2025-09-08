@@ -5,6 +5,51 @@ Very, very much work in progress.
 
 Idea: take a list of bluesky posts and re-rank them.
 
+## Features
+
+- SQLite storage with upsert-by-URI (engagement refresh on repeat runs)
+- Rankers: trivial, popularity-based, and topic-based (TF‑IDF / count / SBERT)
+- Optional posting of priorities to a feed‑generator API
+
+## Quickstart
+
+1) Install requirements
+```
+pip install -r requirements.txt
+```
+
+2) Fetch recent public posts (defaults shown)
+```
+python blueskyranker/fetcher.py \
+  --handles news-flows-nl.bsky.social news-flows-ir.bsky.social news-flows-cz.bsky.social news-flows-fr.bsky.social \
+  --max-age-days 7 --sqlite-path newsflows.db
+```
+
+3) Rank per handle (TF‑IDF topic clustering example)
+```
+from blueskyranker.fetcher import ensure_db, load_posts_df
+from blueskyranker.ranker import TopicRanker
+
+conn = ensure_db('newsflows.db')
+df_nl = load_posts_df(conn, handle='news-flows-nl.bsky.social', limit=2000)
+
+ranker = TopicRanker(returnformat='dataframe', method='networkclustering-tfidf', descending=True)
+ranking_nl = ranker.rank(df_nl)
+print(ranking_nl.head())
+```
+
+4) Post the priorities (optional)
+```
+from blueskyranker.ranker import TopicRanker
+from dotenv import load_dotenv
+load_dotenv('.env')
+
+ranker = TopicRanker(returnformat='dataframe', method='networkclustering-tfidf', descending=True)
+ranking = ranker.rank(df_nl)
+ranker.post(test=False)
+```
+Set `FEEDGEN_HOSTNAME` and `PRIORITIZE_API_KEY` in `.env`. We use `python-dotenv` to load these.
+
 ## Usage
 
 ### Try it out!
@@ -42,6 +87,10 @@ ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-coun
 ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert', descending=True)
 ```
 
+Advanced parameters:
+- `similarity_threshold` (float, default 0.2): raise for fewer/tighter clusters.
+- `vectorizer_stopwords` ('english' | list[str] | None): stopwords for TF‑IDF/Count vectorizers.
+
 If you then want to post the ranked posts to a server, you can --- after having called `.rank()` simply call `.post()`:
 ```
 ranker3.post(test=False)
@@ -54,16 +103,16 @@ We use `python-dotenv` to load these values; make sure it is installed (`pip ins
 You can fetch recent public posts, then run the topic ranker separately per handle. For example:
 
 ```
-import polars as pl
-from blueskyranker.fetcher import Fetcher
+from blueskyranker.fetcher import ensure_db, load_posts_df, Fetcher
 from blueskyranker.ranker import TopicRanker
 
-# Download recent public posts for default handles
+# Download recent public posts for default handles (writes to SQLite)
 fetcher = Fetcher()
 print(fetcher.fetch())
 
-# Rank per handle using TF–IDF topical clustering
-df_nl = pl.read_csv('news-flows-nl_bsky_social_author_feed.csv')
+# Rank per handle using TF–IDF topical clustering (load from SQLite)
+conn = ensure_db('newsflows.db')
+df_nl = load_posts_df(conn, handle='news-flows-nl.bsky.social', limit=2000)
 ranker = TopicRanker(returnformat='dataframe', method='networkclustering-tfidf', descending=True)
 ranking_nl = ranker.rank(df_nl)
 print(ranking_nl.head())
@@ -116,14 +165,29 @@ rows = import_csvs_to_db(conn, csvs)
 print(f"Imported {rows} rows from CSVs into SQLite")
 ```
 
-## Demo of the whole pipeline
-Check out  `example.ipynb` to see how we first download the data and then rank it!
+## End‑to‑end demo
+Check out `example.ipynb` to see how we first download the data and then rank it!
 
+## Internals (short)
 
-## Detailed Documentation
+- Fetcher uses the public AppView (`https://public.api.bsky.app/xrpc`) via `atproto` and paginates with polite pacing.
+- Incremental fetching: for each handle, we stop early once posts are older than `--max-age-days`; we also use the latest `createdAt` in the DB to avoid refetching older content.
+- SQLite schema columns: `uri, cid, author_handle, author_did, indexedAt, createdAt, text, reply_root_uri, reply_parent_uri, is_repost, like_count, repost_count, reply_count, quote_count, news_title, news_description, news_uri`.
+- Rankers
+  - TrivialRanker: keeps input order.
+  - PopularityRanker: sorts by a chosen engagement metric.
+  - TopicRanker: builds a similarity graph (TF‑IDF/Count/SBERT), thresholds it, then applies Leiden clustering; clusters are ordered by aggregate engagement and interleaved for diversity.
+- Priority semantics: the feed API treats LOWER numbers as higher priority (0 is highest). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
 
-(to follow)
+### Assumptions
+- Public AppView endpoints are reachable; engagement counts may drift between runs.
+- Posts can be multilingual; clustering quality improves with language-aware preprocessing and stopwords.
+- Embedded link metadata (title/description/uri) may be missing. Empty strings are normalized to NULL in SQLite. The fetcher flags any empty-string anomalies in its final report (these indicate an upstream embed extraction issue).
 
-## References
+## To‑Do / Roadmap
 
-(to follow)
+- Language detection + stopwording to improve topical purity in multilingual streams.
+- Optional GPU acceleration / batching tips for SBERT; add README notes.
+- Small CLI for DB queries (top engaged per handle, last N posts, etc.).
+- More unit tests around fetch pagination and embed extraction.
+- Expand example notebook to showcase SQLite workflows and SBERT best practices.

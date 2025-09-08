@@ -147,7 +147,9 @@ class TopicRanker(_BaseRanker):
             returnformat: Literal["id","dicts","dataframe"],
             method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbert'],
             descending: bool,
-            metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement'):
+            metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement',
+            similarity_threshold: float = 0.2,
+            vectorizer_stopwords: str | list[str] | None = None):
         self.required_keys = {'uri', 'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
         self.returnformat = returnformat
         if metric != 'engagement':
@@ -155,21 +157,23 @@ class TopicRanker(_BaseRanker):
         self.metric = metric
         self.method = method
         self.descending = descending
+        self.similarity_threshold = similarity_threshold
+        self.stopwords = vectorizer_stopwords
         self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
 
     
-    def _cluster(self, data: pl.DataFrame, threshold = .2, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
+    def _cluster(self, data: pl.DataFrame, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
         """This function clusters the texts using the Leiden Algorithm by Traag, Waltman, & Van Eck (2019),
         See also suggestions by Trilling & Van Hoof (2020) for  news event clustering.
         It adds a column "cluster" and a column "clustersize" to the dataframe.
         """
         logger.debug("Creating cosine similarity matrix...")
         if similarity =='tfidf-cosine':
-            vectorizer = TfidfVectorizer()   
+            vectorizer = TfidfVectorizer(stop_words=self.stopwords)   
             bow = vectorizer.fit_transform(data['text'])
             sim_matrix = cosine_similarity(bow)
         elif similarity =='count-cosine':
-            vectorizer = CountVectorizer()   
+            vectorizer = CountVectorizer(stop_words=self.stopwords)   
             bow = vectorizer.fit_transform(data['text'])
             sim_matrix = cosine_similarity(bow)
         elif similarity == 'sbert-cosine':
@@ -181,8 +185,8 @@ class TopicRanker(_BaseRanker):
         else:
             raise NotImplementedError(f"Simiarity {similarity} is not implemented")
 
-        logger.debug(f"Removing all entries below a threshold of {threshold}")
-        filtered_matrix = np.where(sim_matrix >= threshold, sim_matrix, 0)
+        logger.debug(f"Removing all entries below a threshold of {self.similarity_threshold}")
+        filtered_matrix = np.where(sim_matrix >= self.similarity_threshold, sim_matrix, 0)
         sparsity = 1.0 -(np.count_nonzero(filtered_matrix) / float(filtered_matrix.size) )
         logger.debug(f"The new matrix is {sparsity:.2%} sparse")
         logger.debug("Creating a graph")

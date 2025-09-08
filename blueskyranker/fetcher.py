@@ -109,6 +109,14 @@ def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
     """Upsert rows by uri. Returns number of rows affected (inserted or updated)."""
     if not rows:
         return 0
+    # Normalize embed fields: store NULL for empty strings
+    def _norm(r: Dict[str, Any]) -> Dict[str, Any]:
+        for k in ("news_title", "news_description", "news_uri"):
+            v = r.get(k)
+            if isinstance(v, str) and v.strip() == "":
+                r[k] = None
+        return r
+    rows = [_norm(dict(r)) for r in rows]
     cols = CSV_HEADERS
     placeholders = ",".join([":"+c for c in cols])
     update_clause = ",".join([f"{c}=excluded.{c}" for c in cols if c != "uri"])  # leave PK as-is
@@ -336,6 +344,9 @@ def fetch_author_feed_all(
     sum_quotes = 0
     first_dt = None
     last_dt = None
+    embed_empty_title = 0
+    embed_empty_desc = 0
+    embed_empty_uri = 0
 
     cursor: Optional[str] = None
     page_bar = tqdm(desc=f"[{actor}] pages", unit="page", dynamic_ncols=True, leave=False)
@@ -370,6 +381,14 @@ def fetch_author_feed_all(
         # Always keep in-window posts on this page
         for item in page_keep:
             flat = flatten_item(item)
+            # Track empty-string anomalies in embed fields
+            if isinstance(flat.get("news_title"), str) and flat["news_title"].strip() == "":
+                embed_empty_title += 1
+            if isinstance(flat.get("news_description"), str) and flat["news_description"].strip() == "":
+                embed_empty_desc += 1
+            if isinstance(flat.get("news_uri"), str) and flat["news_uri"].strip() == "":
+                embed_empty_uri += 1
+
             rows.append(flat)
             total_posts += 1
             posts_pbar.update(1)
@@ -441,6 +460,10 @@ def fetch_author_feed_all(
         "last_post": dt_to_iso(last_dt),
         "elapsed_sec": elapsed,
         "rate_posts_per_sec": rate,
+        # Embed anomaly flags (empty strings should not occur; indicates upstream issue)
+        "embed_empty_title": embed_empty_title,
+        "embed_empty_description": embed_empty_desc,
+        "embed_empty_uri": embed_empty_uri,
     }
     return rows, stats
 
@@ -478,6 +501,12 @@ def final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
         lines.append(f"  Time range            : {s['first_post']}  →  {s['last_post']}")
         lines.append(f"  Time taken            : {s['elapsed_sec']:.2f}s")
         lines.append(f"  Effective rate        : {s['rate_posts_per_sec']:.2f} posts/sec")
+        # Flag anomalies from upstream embed extraction scripts
+        if s.get('embed_empty_title') or s.get('embed_empty_description') or s.get('embed_empty_uri'):
+            lines.append("  WARN embed anomalies  :")
+            lines.append(f"    - empty news_title  : {s.get('embed_empty_title', 0)}")
+            lines.append(f"    - empty news_descr. : {s.get('embed_empty_description', 0)}")
+            lines.append(f"    - empty news_uri    : {s.get('embed_empty_uri', 0)}")
 
     total_posts = int(grand["posts"])
     lines.append("\n" + "-"*72)
