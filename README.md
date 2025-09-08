@@ -168,6 +168,24 @@ print(f"Imported {rows} rows from CSVs into SQLite")
 ## End‑to‑end demo
 Check out `example.ipynb` to see how we first download the data and then rank it!
 
+## Cluster Report
+
+You can generate a per-handle topic report (top clusters with keywords, sizes, engagement, and sample headlines) straight from SQLite.
+
+CLI
+```
+python -m blueskyranker.cluster_report --db newsflows.db --output cluster_report.md \
+  --method networkclustering-sbert --sample-max 300 --similarity-threshold 0.2 --stopwords english
+```
+
+Programmatic
+```
+from blueskyranker.cluster_report import generate_cluster_report
+generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
+                        method='networkclustering-tfidf', sample_max=600,
+                        similarity_threshold=0.2, vectorizer_stopwords='english')
+```
+
 ## Internals (short)
 
 - Fetcher uses the public AppView (`https://public.api.bsky.app/xrpc`) via `atproto` and paginates with polite pacing.
