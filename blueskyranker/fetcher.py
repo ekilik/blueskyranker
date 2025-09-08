@@ -56,11 +56,6 @@ from tqdm import tqdm
 import logging
 
 logger = logging.getLogger('BSRlog')
-logging.basicConfig(
-    format='%(asctime)s %(levelname)-8s %(message)s',
-    #datefmt='%Y-%m-%d %H:%M:%S')
-    datefmt='%H:%M:%S')
-logger.setLevel(logging.DEBUG)
 
 APPVIEW_XRPC = "https://public.api.bsky.app/xrpc"
 PAGE_LIMIT = 100
@@ -619,6 +614,8 @@ class Fetcher():
 
 
 def main():
+    logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%H:%M:%S')
+    logger.setLevel(logging.DEBUG)
     parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, max-age cutoff, incremental updates, and embed extraction (SQLite storage).")
     parser.add_argument(
         "--handles",

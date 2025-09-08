@@ -10,11 +10,6 @@ import requests
 
 import logging
 logger = logging.getLogger('BSRlog')
-logging.basicConfig(
-    format='%(asctime)s %(levelname)-8s %(message)s',
-    #datefmt='%Y-%m-%d %H:%M:%S')
-    datefmt='%H:%M:%S')
-logger.setLevel(logging.DEBUG)
 
 # for topic ranker:
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer  
@@ -336,6 +331,8 @@ def sampledata(filename: str | None = None):
 
 
 if __name__=="__main__":
+    logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%H:%M:%S')
+    logger.setLevel(logging.DEBUG)
     print("Testing the bluesky ranker...")
     data = sampledata()
     ranker = TrivialRanker(returnformat='id', descending=True)
