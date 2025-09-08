@@ -30,16 +30,16 @@ Bluesky topic ranker and pipeline for the NEWSFLOWS project. Fetch public posts 
 ## Quickstart
 
 1) Install requirements
-```
+```bash
 pip install -r requirements.txt
 ```
 
 2) Option A: Create a small sample SQLite from the bundled CSV (no network)
-```
+```bash
 python -m blueskyranker.sample_db --db newsflows_sample.db
 ```
 Then load rows directly from SQLite:
-```
+```python
 from blueskyranker.fetcher import ensure_db, load_posts_df
 conn = ensure_db('newsflows_sample.db')
 df = load_posts_df(conn)
@@ -47,7 +47,7 @@ print(df.head())
 ```
 
 2) Option B: Fetch recent public posts (defaults shown)
-```
+```bash
 python blueskyranker/fetcher.py \
   --handles news-flows-nl.bsky.social news-flows-ir.bsky.social news-flows-cz.bsky.social news-flows-fr.bsky.social \
   --max-age-days 7 --sqlite-path newsflows.db
@@ -57,7 +57,7 @@ Notes:
 - Full refresh of the window: add `--refresh-window` to re‑fetch the entire N‑day window (updates engagement for all posts in that period).
 
 3) Rank per handle (TF‑IDF topic clustering example)
-```
+```python
 from blueskyranker.fetcher import ensure_db, load_posts_df
 from blueskyranker.ranker import TopicRanker
 
@@ -80,7 +80,7 @@ print(ranking_nl.head())
 ```
 
 4) Post the priorities (optional)
-```
+```python
 from blueskyranker.ranker import TopicRanker
 from dotenv import load_dotenv
 load_dotenv('.env')
@@ -96,7 +96,7 @@ Set `FEEDGEN_HOSTNAME` and `PRIORITIZE_API_KEY` in `.env`. We use `python-dotenv
 Priority semantics: the feed API treats LOWER numbers as higher priority (priority 0 is highest). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
 
 Basic rankers (programmatic):
-```
+```python
 from blueskyranker import TrivialRanker, PopularityRanker
 
 trivial = TrivialRanker(returnformat='id', metric=None, descending=True)
@@ -108,7 +108,7 @@ TopicRanker (clusters + engagement ordering): see Quickstart and Time Windows se
 ### Fetch and rank per handle
 You can fetch recent public posts, then run the topic ranker separately per handle. For example:
 
-```
+```python
 from blueskyranker.fetcher import ensure_db, load_posts_df, Fetcher
 from blueskyranker.ranker import TopicRanker
 
@@ -127,13 +127,13 @@ print(ranking_nl.head())
 ### Storage: SQLite (default)
 Fetched posts are stored in a SQLite database and upserted by `uri` (so engagement metrics and metadata are refreshed on subsequent runs). The database defaults to `newsflows.db` in the working directory.
 
-```
+```bash
 python blueskyranker/fetcher.py --max-age-days 7 --sqlite-path newsflows.db
 ```
 
 If you need CSVs (for exploration or interoperability), export them from the DB in a short Python snippet:
 
-```
+```python
 from blueskyranker.fetcher import ensure_db, export_db_to_csv
 conn = ensure_db('newsflows.db')
 paths = export_db_to_csv(conn, output_dir='.', include_combined=True)
@@ -145,7 +145,7 @@ This writes per-handle CSVs like `news-flows-nl_bsky_social_author_feed.csv` and
 ### Load posts from SQLite into Polars
 You can work directly from the database without exporting to CSV:
 
-```
+```python
 import polars as pl
 from blueskyranker.fetcher import ensure_db, load_posts_df
 
@@ -157,7 +157,7 @@ print(df_nl.head())
 ### Migrate existing CSVs into SQLite
 If you have older CSVs from previous runs, you can import them into the database (upsert by `uri`) to keep history and let future runs refresh engagement counts:
 
-```
+```python
 from blueskyranker.fetcher import ensure_db, import_csvs_to_db
 
 conn = ensure_db('newsflows.db')
@@ -183,7 +183,7 @@ You can control how many days of posts are used for:
 
 A CLI runs the whole flow per handle and logs pushed clusters:
 
-```
+```bash
 python -m blueskyranker.pipeline \
   --handles news-flows-nl.bsky.social news-flows-fr.bsky.social \
   --method networkclustering-tfidf \
@@ -197,7 +197,7 @@ python -m blueskyranker.pipeline \
 
 Programmatic one‑liner:
 
-```
+```python
 from blueskyranker.pipeline import run_fetch_rank_push
 
 run_fetch_rank_push(
@@ -209,7 +209,7 @@ run_fetch_rank_push(
 
 Each push appends a concise summary to the log, e.g.:
 
-```
+```text
 2025-09-08T15:45:02+0000 INFO     [OK] handle=news-flows-nl.bsky.social posts=42 method=networkclustering-tfidf threshold=0.2 windows=(cluster=7d, engagement=3d, push=1d)
   cluster=12 size=10 engagement=538 keywords="europe policy migration"
   cluster=4  size=8  engagement=410 keywords="covid vaccine health"
@@ -220,7 +220,7 @@ Each push appends a concise summary to the log, e.g.:
 
 Add `--dry-run` to print an intelligible summary and a priority preview instead of calling the API:
 
-```
+```bash
 python -m blueskyranker.pipeline \
   --handles news-flows-nl.bsky.social \
   --method networkclustering-tfidf --similarity-threshold 0.2 \
@@ -246,13 +246,13 @@ Sample output (abbreviated):
 You can generate a per-handle topic report (top clusters with keywords, sizes, engagement, and sample headlines) straight from SQLite.
 
 CLI
-```
+```bash
 python -m blueskyranker.cluster_report --db newsflows.db --output cluster_report.md \
   --method networkclustering-sbert --sample-max 300 --similarity-threshold 0.2 --stopwords english
 ```
 
 Programmatic
-```
+```python
 from blueskyranker.cluster_report import generate_cluster_report
 generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
                         method='networkclustering-tfidf', sample_max=600,
@@ -273,7 +273,7 @@ generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
 ## Configuration (.env)
 For posting to the feed generator:
 
-```
+```ini
 FEEDGEN_HOSTNAME=feed.example.org
 PRIORITIZE_API_KEY=...secret...
 ```
