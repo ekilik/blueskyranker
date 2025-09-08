@@ -20,8 +20,7 @@ logger.setLevel(logging.DEBUG)
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer  
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-import igraph as ig
-import leidenalg
+# Delay heavy imports (igraph, leidenalg) until needed in _cluster
 
 load_dotenv(".env")
 
@@ -149,8 +148,12 @@ class TopicRanker(_BaseRanker):
             descending: bool,
             metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement',
             similarity_threshold: float = 0.2,
-            vectorizer_stopwords: str | list[str] | None = None):
-        self.required_keys = {'uri', 'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
+            vectorizer_stopwords: str | list[str] | None = None,
+            cluster_window_days: int | None = None,
+            engagement_window_days: int | None = None,
+            push_window_days: int | None = None,
+        ):
+        self.required_keys = {'uri', 'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri', 'createdAt'} 
         self.returnformat = returnformat
         if metric != 'engagement':
             raise NotImplementedError
@@ -159,6 +162,9 @@ class TopicRanker(_BaseRanker):
         self.descending = descending
         self.similarity_threshold = similarity_threshold
         self.stopwords = vectorizer_stopwords
+        self.cluster_window_days = cluster_window_days
+        self.engagement_window_days = engagement_window_days
+        self.push_window_days = push_window_days
         self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
 
     
@@ -190,6 +196,9 @@ class TopicRanker(_BaseRanker):
         sparsity = 1.0 -(np.count_nonzero(filtered_matrix) / float(filtered_matrix.size) )
         logger.debug(f"The new matrix is {sparsity:.2%} sparse")
         logger.debug("Creating a graph")
+        # Lazy import to avoid hard dependency during tests or when stubbing clustering
+        import igraph as ig
+        import leidenalg
         g = ig.Graph.Weighted_Adjacency(filtered_matrix.tolist(), mode="UNDIRECTED", attr="weight")
         g.vs["cid"] = data['cid']
         logger.debug("Apply network clustering using the Leiden Algorithm")
@@ -208,13 +217,14 @@ class TopicRanker(_BaseRanker):
         data = self._add_cluster_stats(data)
         return data
 
-    def _add_cluster_stats(self, df_with_clusters):
+    def _add_cluster_stats(self, df_with_clusters, stats_subset: pl.DataFrame | None = None):
         """Takes dataframe with cluster labels and adds cluster statistics.
 
         engagement_rank is computed so that 1 = highest engagement within the dataset,
         independent of the outer 'descending' flag.
         """
-        clusterstats = df_with_clusters.group_by('cluster').agg(pl.col('like_count').sum(),
+        src = stats_subset if stats_subset is not None else df_with_clusters
+        clusterstats = src.group_by('cluster').agg(pl.col('like_count').sum(),
             pl.col('reply_count').sum(),
             pl.col('quote_count').sum(),
             pl.col('repost_count').sum(),
@@ -233,17 +243,32 @@ class TopicRanker(_BaseRanker):
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """This ranker clusters the input by topic, and then creates a feedback loop by
         upranking the most popular topic"""
+        from datetime import datetime, timedelta, timezone
         df = self._transform_input(data)
 
+        # Parse createdAt to datetime for windowing
+        if 'createdAt_dt' not in df.columns:
+            df = df.with_columns(createdAt_dt=pl.col('createdAt').str.strptime(pl.Datetime, strict=False))
+
+        now = datetime.now(timezone.utc)
+        # Determine effective cluster window so every later subset is covered
+        windows = [w for w in [self.cluster_window_days, self.engagement_window_days, self.push_window_days] if w is not None]
+        effective_cluster_days = max(windows) if windows else None
+        if effective_cluster_days is not None:
+            cluster_cutoff = now - timedelta(days=int(effective_cluster_days))
+            df_cluster_base = df.filter(pl.col('createdAt_dt') >= cluster_cutoff)
+        else:
+            df_cluster_base = df
+
         if self.method == 'networkclustering-tfidf':
-            df_with_clusters = self._cluster(df, similarity='tfidf-cosine')
+            df_with_clusters = self._cluster(df_cluster_base, similarity='tfidf-cosine')
         if self.method == 'networkclustering-count':
-            df_with_clusters = self._cluster(df, similarity='count-cosine')
+            df_with_clusters = self._cluster(df_cluster_base, similarity='count-cosine')
         if self.method == 'networkclustering-sbert':
-            if len(data)>100:
-                logger.warning(f"Do you really want to do this? You have {len(data)} texts, calculating sentence embeddings will be REALLY slow")
+            if len(df_cluster_base)>100:
+                logger.warning(f"Do you really want to do this? You have {len(df_cluster_base)} texts, calculating sentence embeddings will be REALLY slow")
                 logger.warning(f"Consider using another method, or submitting less document")
-            df_with_clusters = self._cluster(df, similarity='sbert-cosine')
+            df_with_clusters = self._cluster(df_cluster_base, similarity='sbert-cosine')
               
         # OPTION 1
         # This here would be a very simplistic ranking, we simply rank by cluster size
@@ -257,6 +282,14 @@ class TopicRanker(_BaseRanker):
 
         # With engagement_rank defined as 1 = highest engagement, we put
         # most-engaged clusters first when descending=True.
+        # Compute engagement stats over an optional engagement window (subset of clustered rows)
+        if self.engagement_window_days is not None:
+            engagement_cutoff = now - timedelta(days=int(self.engagement_window_days))
+            stats_subset = df_with_clusters.filter(pl.col('createdAt_dt') >= engagement_cutoff)
+        else:
+            stats_subset = None
+        df_with_clusters = self._add_cluster_stats(df_with_clusters, stats_subset=stats_subset)
+
         df_with_clusters = df_with_clusters.sort(
             by='cluster_engagement_rank', descending=not self.descending
         )
@@ -278,12 +311,24 @@ class TopicRanker(_BaseRanker):
         list_of_clusters_gen = (cluster.rows(named=True)  for _, cluster in df_with_clusters.group_by('cluster_engagement_rank', maintain_order=True))
         fancyranking = [item for cluster in zip_longest(*list_of_clusters_gen) for item in cluster if item is not None]
         final_ranking = pl.DataFrame(fancyranking)
+
+        # Optionally restrict the output to a push window
+        if self.push_window_days is not None:
+            push_cutoff = now - timedelta(days=int(self.push_window_days))
+            final_ranking = final_ranking.filter(pl.col('createdAt_dt') >= push_cutoff)
+
         self.ranking = final_ranking
         return self._transform_output(final_ranking)
 
 
-def sampledata(filename="example_news.csv"):
-    """provides sample data for offline testing"""
+def sampledata(filename: str | None = None):
+    """Provides sample data for offline testing.
+
+    If filename is None, loads the bundled CSV next to this module.
+    """
+    from pathlib import Path
+    if filename is None:
+        filename = str(Path(__file__).with_name('example_news.csv'))
     data = pl.read_csv(filename).to_dicts()
     return data
 

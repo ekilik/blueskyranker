@@ -218,3 +218,5 @@ archive/
 # Validation utilities and reports (not for commit)
 validation/
 cluster_report.md
+validation_exports/
+*.db

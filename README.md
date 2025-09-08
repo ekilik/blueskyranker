@@ -10,6 +10,7 @@ Idea: take a list of bluesky posts and re-rank them.
 - SQLite storage with upsert-by-URI (engagement refresh on repeat runs)
 - Rankers: trivial, popularity-based, and topic-based (TF‑IDF / count / SBERT)
 - Optional posting of priorities to a feed‑generator API
+- End‑to‑end fetch → rank (per handle) → push pipeline with user‑controlled time windows
 
 ## Quickstart
 
@@ -18,7 +19,19 @@ Idea: take a list of bluesky posts and re-rank them.
 pip install -r requirements.txt
 ```
 
-2) Fetch recent public posts (defaults shown)
+2) Option A: Create a small sample SQLite from the bundled CSV (no network)
+```
+python -m blueskyranker.sample_db --db newsflows_sample.db
+```
+Then load rows directly from SQLite:
+```
+from blueskyranker.fetcher import ensure_db, load_posts_df
+conn = ensure_db('newsflows_sample.db')
+df = load_posts_df(conn)
+print(df.head())
+```
+
+2) Option B: Fetch recent public posts (defaults shown)
 ```
 python blueskyranker/fetcher.py \
   --handles news-flows-nl.bsky.social news-flows-ir.bsky.social news-flows-cz.bsky.social news-flows-fr.bsky.social \
@@ -30,10 +43,20 @@ python blueskyranker/fetcher.py \
 from blueskyranker.fetcher import ensure_db, load_posts_df
 from blueskyranker.ranker import TopicRanker
 
-conn = ensure_db('newsflows.db')
-df_nl = load_posts_df(conn, handle='news-flows-nl.bsky.social', limit=2000)
+conn = ensure_db('newsflows_sample.db')  # or 'newsflows.db' if you fetched live
+df_nl = load_posts_df(conn, handle='sample.handle', limit=2000)  # adjust handle if needed
 
-ranker = TopicRanker(returnformat='dataframe', method='networkclustering-tfidf', descending=True)
+ranker = TopicRanker(
+    returnformat='dataframe',
+    method='networkclustering-tfidf',
+    descending=True,
+    similarity_threshold=0.2,
+    vectorizer_stopwords='english',
+    # Optional time windows (days):
+    cluster_window_days=7,        # how far back to consider for clustering
+    engagement_window_days=3,     # how far back to compute engagement per cluster
+    push_window_days=1,           # how far back to include items in the output
+)
 ranking_nl = ranker.rank(df_nl)
 print(ranking_nl.head())
 ```
@@ -90,6 +113,8 @@ ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sber
 Advanced parameters:
 - `similarity_threshold` (float, default 0.2): raise for fewer/tighter clusters.
 - `vectorizer_stopwords` ('english' | list[str] | None): stopwords for TF‑IDF/Count vectorizers.
+- Time windows (days): `cluster_window_days`, `engagement_window_days`, `push_window_days`.
+  - If provided, the fetch window should be at least the max of these values.
 
 If you then want to post the ranked posts to a server, you can --- after having called `.rank()` simply call `.post()`:
 ```
@@ -168,6 +193,73 @@ print(f"Imported {rows} rows from CSVs into SQLite")
 ## End‑to‑end demo
 Check out `example.ipynb` to see how we first download the data and then rank it!
 
+## Time windows and pipeline
+
+You can control how many days of posts are used for:
+- Clustering (`cluster_window_days`)
+- Engagement ranking of clusters (`engagement_window_days`)
+- Final push to the API (`push_window_days`)
+
+A CLI runs the whole flow per handle and logs pushed clusters:
+
+```
+python -m blueskyranker.pipeline \
+  --handles news-flows-nl.bsky.social news-flows-fr.bsky.social \
+  --method networkclustering-tfidf \
+  --similarity-threshold 0.2 \
+  --cluster-window-days 7 \
+  --engagement-window-days 3 \
+  --push-window-days 1 \
+  --log-path push.log \
+  --no-test
+```
+
+Programmatic one‑liner:
+
+```
+from blueskyranker.pipeline import run_fetch_rank_push
+
+run_fetch_rank_push(
+    handles=['news-flows-nl.bsky.social'],
+    method='networkclustering-tfidf', similarity_threshold=0.2,
+    cluster_window_days=7, engagement_window_days=3, push_window_days=1,
+    include_pins=False, test=False, log_path='push.log')
+```
+
+Each push appends a concise summary to the log, e.g.:
+
+```
+2025-09-08T15:45:02+0000 INFO     [OK] handle=news-flows-nl.bsky.social posts=42 method=networkclustering-tfidf threshold=0.2 windows=(cluster=7d, engagement=3d, push=1d)
+  cluster=12 size=10 engagement=538 keywords="europe policy migration"
+  cluster=4  size=8  engagement=410 keywords="covid vaccine health"
+  cluster=9  size=6  engagement=295 keywords="energy gas price"
+```
+
+### Dry run (no API call)
+
+Add `--dry-run` to print an intelligible summary and a priority preview instead of calling the API:
+
+```
+python -m blueskyranker.pipeline \
+  --handles news-flows-nl.bsky.social \
+  --method networkclustering-tfidf --similarity-threshold 0.2 \
+  --cluster-window-days 7 --engagement-window-days 3 --push-window-days 1 \
+  --dry-run
+```
+
+Sample output (abbreviated):
+
+```
+=== Dry Run: handle=news-flows-nl.bsky.social posts=42 method=networkclustering-tfidf threshold=0.2 windows=(cluster=7d, engagement=3d, push=1d)
+  cluster=12 size=10 engagement=538 keywords="europe policy migration"
+  cluster=4  size=8  engagement=410 keywords="covid vaccine health"
+  cluster=9  size=6  engagement=295 keywords="energy gas price"
+  Priority preview (top 15):
+      0  c=12    2025-09-08T...  at://...  | Title of the top story
+      1  c=4     2025-09-08T...  at://...  | Another headline
+      ...
+```
+
 ## Cluster Report
 
 You can generate a per-handle topic report (top clusters with keywords, sizes, engagement, and sample headlines) straight from SQLite.
@@ -204,8 +296,4 @@ generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
 
 ## To‑Do / Roadmap
 
-- Language detection + stopwording to improve topical purity in multilingual streams.
-- Optional GPU acceleration / batching tips for SBERT; add README notes.
-- Small CLI for DB queries (top engaged per handle, last N posts, etc.).
-- More unit tests around fetch pagination and embed extraction.
 - Expand example notebook to showcase SQLite workflows and SBERT best practices.
