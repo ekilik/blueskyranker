@@ -212,6 +212,7 @@ __marimo__/
 # PHILIPP
 archive/
 .DS_Store
+.jupyter/
 
 # seems unlikely we ever want to commit the data 
 .csv
