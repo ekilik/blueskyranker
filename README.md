@@ -69,20 +69,23 @@ ranking_nl = ranker.rank(df_nl)
 print(ranking_nl.head())
 ```
 
-### Storing data: CSV or SQLite
-By default, fetched posts are appended to per-handle CSVs (with de-duplication by `uri`) and a combined CSV. Alternatively, you can store everything in a SQLite database and upsert rows by `uri` (so engagement metrics are refreshed instead of duplicated).
-
-Use the CLI to choose the storage backend:
+### Storage: SQLite (default)
+Fetched posts are stored in a SQLite database and upserted by `uri` (so engagement metrics and metadata are refreshed on subsequent runs). The database defaults to `newsflows.db` in the working directory.
 
 ```
-# CSV (default)
-python blueskyranker/fetcher.py --max-age-days 7 --storage csv
-
-# SQLite (upsert-by-uri)
-python blueskyranker/fetcher.py --max-age-days 7 --storage sqlite --sqlite-path newsflows.db
+python blueskyranker/fetcher.py --max-age-days 7 --sqlite-path newsflows.db
 ```
 
-In SQLite mode, posts are written to a `posts` table with `uri` as the primary key. Re-fetching upserts updated engagement counts and other metadata.
+If you need CSVs (for exploration or interoperability), export them from the DB in a short Python snippet:
+
+```
+from blueskyranker.fetcher import ensure_db, export_db_to_csv
+conn = ensure_db('newsflows.db')
+paths = export_db_to_csv(conn, output_dir='.', include_combined=True)
+print(paths)
+```
+
+This writes per-handle CSVs like `news-flows-nl_bsky_social_author_feed.csv` and a combined CSV `all_handles_author_feed.csv`.
 
 ## Demo of the whole pipeline
 Check out  `example.ipynb` to see how we first download the data and then rank it!

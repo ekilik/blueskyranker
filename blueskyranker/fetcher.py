@@ -65,7 +65,7 @@ APPVIEW_XRPC = "https://public.api.bsky.app/xrpc"
 PAGE_LIMIT = 100
 SLEEP_SEC = 0.20  # polite pacing
 
-# Canonical post fields used for CSV and SQLite
+# Canonical post fields used for exports and SQLite
 CSV_HEADERS = [
     "uri","cid","author_handle","author_did","indexedAt","createdAt","text",
     "reply_root_uri","reply_parent_uri","is_repost",
@@ -127,6 +127,39 @@ def latest_created_at_in_db(conn: sqlite3.Connection, handle: str) -> Optional[d
     max_created = row[0]
     return iso_to_dt(max_created) if max_created else None
 
+def export_db_to_csv(conn: sqlite3.Connection, output_dir: str = ".", include_combined: bool = True) -> List[str]:
+    """Export posts per handle to CSV files and optionally a combined CSV.
+
+    Returns list of written file paths.
+    """
+    out_paths: List[str] = []
+    cur = conn.execute("SELECT DISTINCT author_handle FROM posts ORDER BY author_handle")
+    handles = [r[0] for r in cur.fetchall() if r[0]]
+    combined_rows: List[Dict[str, Any]] = []
+    for h in handles:
+        rows_cur = conn.execute("SELECT * FROM posts WHERE author_handle=? ORDER BY createdAt", (h,))
+        rows = [dict(zip([c[0] for c in rows_cur.description], r)) for r in rows_cur.fetchall()]
+        # Normalize to CSV headers order
+        rows_csv = [{k: r.get(k) for k in CSV_HEADERS} for r in rows]
+        path = os.path.join(output_dir, f"{h.replace('.', '_')}_author_feed.csv")
+        ensure_headers(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            for row in rows_csv:
+                w.writerow(row)
+        out_paths.append(path)
+        combined_rows.extend(rows_csv)
+
+    if include_combined and combined_rows:
+        cpath = os.path.join(output_dir, "all_handles_author_feed.csv")
+        ensure_headers(cpath)
+        with open(cpath, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            for row in combined_rows:
+                w.writerow(row)
+        out_paths.append(cpath)
+    return out_paths
+
 def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -146,47 +179,12 @@ def dt_to_iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat()
 
 def ensure_headers(path: str) -> bool:
-    """Create file with header if it doesn't exist. Return True if newly created."""
+    """(Legacy) Create file with header if it doesn't exist. Return True if newly created."""
     if os.path.exists(path):
         return False
     with open(path, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=CSV_HEADERS).writeheader()
     return True
-
-def load_existing_uris(path: str) -> Set[str]:
-    """Return set of URIs already present in an existing CSV (if it exists)."""
-    if not os.path.exists(path):
-        return set()
-    uris: Set[str] = set()
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            uri = row.get("uri")
-            if uri:
-                uris.add(uri)
-    return uris
-
-def latest_created_at_in_csv(path: str) -> Optional[datetime]:
-    """Return the latest (max) createdAt datetime found in the CSV, if any."""
-    if not os.path.exists(path):
-        return None
-    latest = None
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            ts = row.get("createdAt")
-            if not ts:
-                continue
-            dt = iso_to_dt(ts)
-            if dt and (latest is None or dt > latest):
-                latest = dt
-    return latest
-
-def append_rows(path: str, rows: List[Dict[str, Any]]) -> None:
-    """Append given rows to CSV (assumes header exists)."""
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-        for r in rows:
-            writer.writerow({h: r.get(h) for h in CSV_HEADERS})
 
 def extract_news_embed(item_post: Any, record: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
@@ -477,9 +475,8 @@ class Fetcher():
         max_age_days=7,
         cutoff_check_every=1,
         include_pins=False,
-        storage: str = "csv",
         sqlite_path: Optional[str] = None):
-        """Fetch public Bluesky posts.
+        """Fetch public Bluesky posts (SQLite only).
 
         Parameters:
 
@@ -487,15 +484,11 @@ class Fetcher():
         max_age_days (int): Only keep posts whose createdAt is within the last N days; pagination stops early when older content is reached.
         cutoff_check_every (int)": How many pages between early-stop checks against the cutoff (default: 1 = check every page).
         include_pins (bool): Include pinned posts at the top
-        storage (str): 'csv' (default) or 'sqlite'
-        sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db) when storage='sqlite'
+        sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db)
         """
 
-        assert storage in {"csv", "sqlite"}, "storage must be 'csv' or 'sqlite'"
-        conn: Optional[sqlite3.Connection] = None
-        if storage == "sqlite":
-            db_path = sqlite_path or "newsflows.db"
-            conn = ensure_db(db_path)
+        db_path = sqlite_path or "newsflows.db"
+        conn: sqlite3.Connection = ensure_db(db_path)
 
         posts_pbar = tqdm(desc="Posts fetched (all handles)", unit="post", dynamic_ncols=True)
         combined_new_rows: List[Dict[str, Any]] = []
@@ -505,21 +498,14 @@ class Fetcher():
         start_all = time.perf_counter()
 
         for handle in handles_pbar:
-            out_path = f"{handle.replace('.', '_')}_author_feed.csv"
-
-            if storage == "csv":
-                # Ensure header exists before reading
-                _ = ensure_headers(out_path)
+            out_path = f"{handle.replace('.', '_')}_author_feed.csv"  # legacy filename for status messages only
 
             # Incremental cutoff per handle:
             # Use later of (now - N days) and latest saved createdAt in CSV (if present).
             cutoff_dt: Optional[datetime] = None
             if max_age_days is not None:
                 rel_cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-                if storage == "csv":
-                    latest_saved = latest_created_at_in_csv(out_path)
-                else:
-                    latest_saved = latest_created_at_in_db(conn, handle) if conn else None
+                latest_saved = latest_created_at_in_db(conn, handle)
                 cutoff_dt = max(latest_saved, rel_cutoff) if latest_saved else rel_cutoff
 
             # Fetch rows for the handle
@@ -532,37 +518,14 @@ class Fetcher():
                 cutoff_check_every=cutoff_check_every,
             )
 
-            if storage == "csv":
-                # Prepare append with de-dup
-                existing_uris = load_existing_uris(out_path)
-                new_rows = [r for r in handle_rows if r.get("uri") and r["uri"] not in existing_uris]
-                # Append only new rows
-                append_rows(out_path, new_rows)
-                combined_new_rows.extend(new_rows)
-            else:
-                # Upsert all rows for this handle
-                affected = upsert_rows(conn, handle_rows)
-                combined_new_rows.extend(handle_rows)
+            # Upsert all rows for this handle
+            affected = upsert_rows(conn, handle_rows)
+            combined_new_rows.extend(handle_rows)
 
             # Report: how many NEW and their time frame
-            if storage == "csv":
-                if new_rows:
-                    dts = [iso_to_dt(r.get("createdAt")) for r in new_rows if r.get("createdAt")]
-                    dts = [d for d in dts if d is not None]
-                    new_min = min(dts).isoformat() if dts else None
-                    new_max = max(dts).isoformat() if dts else None
-                    handles_pbar.write(
-                        f"✅ DONE {handle}: added {len(new_rows)} new posts "
-                        f"({new_min} → {new_max}) → {out_path}"
-                    )
-                else:
-                    handles_pbar.write(
-                        f"✅ DONE {handle}: no new posts to append → {out_path}"
-                    )
-            else:
-                handles_pbar.write(
-                    f"✅ DONE {handle}: upserted {len(handle_rows)} posts into SQLite"
-                )
+            handles_pbar.write(
+                f"✅ DONE {handle}: upserted {len(handle_rows)} posts into SQLite"
+            )
 
             # Keep scrape stats (before de-dup)
             per_handle_stats.append(stats)
@@ -570,22 +533,9 @@ class Fetcher():
         elapsed_all = time.perf_counter() - start_all
         posts_pbar.close()
 
-        if storage == "csv":
-            # Combined CSV: append only newly added rows across all handles in this run.
-            combined_path = "all_handles_author_feed.csv"
-            ensure_headers(combined_path)
-            existing_combined_uris = load_existing_uris(combined_path)
-            combined_to_append = [r for r in combined_new_rows if r["uri"] not in existing_combined_uris]
-            append_rows(combined_path, combined_to_append)
-
-            logger.debug(
-                f"\nWrote/updated combined CSV with +{len(combined_to_append)} new rows → {combined_path} "
-                f"({elapsed_all:.2f}s total)."
-            )
-        else:
-            logger.debug(
-                f"\nSQLite upsert complete → {sqlite_path or 'newsflows.db'} ({elapsed_all:.2f}s total)."
-            )
+        logger.debug(
+            f"\nSQLite upsert complete → {db_path} ({elapsed_all:.2f}s total)."
+        )
 
         # Final detailed report for the run (scraped rows prior to de-dup)
         return final_report(per_handle_stats)
@@ -593,7 +543,7 @@ class Fetcher():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, max-age cutoff, incremental updates, and embed extraction.")
+    parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, max-age cutoff, incremental updates, and embed extraction (SQLite storage).")
     parser.add_argument(
         "--handles",
         nargs="+",
@@ -635,15 +585,9 @@ def main():
         help="Exclude pinned posts (default)."
     )
     parser.add_argument(
-        "--storage",
-        choices=["csv", "sqlite"],
-        default="csv",
-        help="Where to persist results: 'csv' (default) or 'sqlite' (upsert by uri)."
-    )
-    parser.add_argument(
         "--sqlite-path",
         default="newsflows.db",
-        help="Path to SQLite database file (when --storage=sqlite)."
+        help="Path to SQLite database file."
     )
     parser.set_defaults(include_pins=False)
     args = parser.parse_args()
@@ -654,7 +598,6 @@ def main():
         max_age_days=args.max_age_days,
         cutoff_check_every=args.cutoff_check_every,
         include_pins=args.include_pins,
-        storage=args.storage,
         sqlite_path=args.sqlite_path,
     )
     print(results)
