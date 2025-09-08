@@ -19,6 +19,11 @@ classifiers = [
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 
+[project.scripts]
+bsr-pipeline = "blueskyranker.pipeline:main"
+bsr-fetch = "blueskyranker.fetcher:main"
+bsr-report = "blueskyranker.cluster_report:main"
+
 [project.urls]
 Homepage = "https://github.com/damian0604/blueskyranker"
 Issues = "https://github.com/damian0604/blueskyranker/issues"

@@ -1,9 +1,18 @@
 # blueskyranker
-This is just a small building block for larger NEWSFLOWS project.
+Bluesky topic ranker and pipeline for the NEWSFLOWS project. Fetch public posts into SQLite, cluster by topic, rank by cluster engagement, and optionally push ranked posts to a feed generator. Supports user‑controlled time windows and a dry‑run mode.
 
-Very, very much work in progress. 
-
-Idea: take a list of bluesky posts and re-rank them.
+## Table of Contents
+- Features
+- Installation
+- Quickstart (SQLite sample or Live Fetch)
+- Usage and Examples
+- Time Windows and Pipeline
+- Dry Run
+- Cluster Report
+- Configuration (.env)
+- Data Schema (SQLite)
+- Troubleshooting
+- End‑to‑end demo / Notebook
 
 ## Features
 
@@ -11,6 +20,12 @@ Idea: take a list of bluesky posts and re-rank them.
 - Rankers: trivial, popularity-based, and topic-based (TF‑IDF / count / SBERT)
 - Optional posting of priorities to a feed‑generator API
 - End‑to‑end fetch → rank (per handle) → push pipeline with user‑controlled time windows
+
+## Installation
+
+- Python 3.10–3.11 recommended
+- Install dependencies: `pip install -r requirements.txt`
+- Optional (console scripts): `pip install -e .` to enable `bsr-pipeline`, `bsr-fetch`, and `bsr-report` commands.
 
 ## Quickstart
 
@@ -190,8 +205,8 @@ rows = import_csvs_to_db(conn, csvs)
 print(f"Imported {rows} rows from CSVs into SQLite")
 ```
 
-## End‑to‑end demo
-Check out `example.ipynb` to see how we first download the data and then rank it!
+## End‑to‑end demo / Notebook
+Check out `example.ipynb` to see how we first download the data and then rank it. The notebook expects a SQLite DB to exist; create one via the sample (`python -m blueskyranker.sample_db --db newsflows_sample.db`) or the fetcher.
 
 ## Time windows and pipeline
 
@@ -288,6 +303,28 @@ generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
   - PopularityRanker: sorts by a chosen engagement metric.
   - TopicRanker: builds a similarity graph (TF‑IDF/Count/SBERT), thresholds it, then applies Leiden clustering; clusters are ordered by aggregate engagement and interleaved for diversity.
 - Priority semantics: the feed API treats LOWER numbers as higher priority (0 is highest). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
+
+## Configuration (.env)
+For posting to the feed generator:
+
+```
+FEEDGEN_HOSTNAME=feed.example.org
+PRIORITIZE_API_KEY=...secret...
+```
+
+Use `test=True` for a test request that doesn’t persist, or `--dry-run` to avoid calling the API entirely.
+
+## Data Schema (SQLite)
+Table `posts` (upsert by `uri`):
+
+`uri, cid, author_handle, author_did, indexedAt, createdAt, text, reply_root_uri, reply_parent_uri, is_repost, like_count, repost_count, reply_count, quote_count, news_title, news_description, news_uri`.
+
+`createdAt` is stored as ISO‑8601 text; the code parses to datetime on demand (assumed UTC).
+
+## Troubleshooting
+- igraph/leidenalg install issues: ensure system packages for igraph are installed before pip installing python‑igraph and leidenalg (platform‑specific).
+- Empty ranking: widen `push_window_days` or check that your DB contains recent posts.
+- SBERT method: slower and memory‑heavier; start with smaller batches.
 
 ### Assumptions
 - Public AppView endpoints are reachable; engagement counts may drift between runs.
