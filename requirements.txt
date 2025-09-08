@@ -4,4 +4,4 @@ leidenalg
 igraph
 tqdm
 atproto
-dotenv
+python-dotenv

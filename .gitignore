@@ -215,3 +215,6 @@ archive/
 
 # seems unlikely we ever want to commit the data 
 .csv
+# Validation utilities and reports (not for commit)
+validation/
+cluster_report.md

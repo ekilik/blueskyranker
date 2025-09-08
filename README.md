@@ -15,7 +15,7 @@ Let's first run a simple ranker that, in fact, doesn't rank but just returns the
 ```
 from blueskyranker import TrivialRanker
 
-ranker = Trivialranker(returnformat='id')
+ranker = TrivialRanker(returnformat='id')
 
 rankedposts = ranker.rank(data)
 ```
@@ -26,20 +26,20 @@ This ranker is set up such that it just returns the ids of the ranked posts. Alt
 You can also rank by popularity:
 ```
 from blueskyranker import PopularityRanker
-ranker = PopularityRanker(returnformat='dicts', metric= "reply_count")  # you can also select metrics like "like_count" etc.
+ranker = PopularityRanker(returnformat='dicts', metric= "reply_count", descending=True)  # or "like_count", etc.
 ```
 
 Finally, and most importantly, you can implement much more advanced rankers, like this one, that clusters all posts, and then ranks posts such that posts from much-engaged clusters (!) are ranked higher. (DETAILED DESCRIPTION TO FOLLOW)
 
-We use descending=False to be compatible with the prioritzie-Endpoint to which we want to posts, which expectes *higher* numbers to get more priority.
+Priority semantics: our feed API treats LOWER numeric values as higher priority (priority 0 is highest). The rankers therefore keep the top item first. Use `descending=True` when you want the “most important” items (e.g., highest engagement/topic) at the top of the list.
 
 ```
 from blueskyranker import TopicRanker
     
-ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=False)
-ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count', descending=False)
-# the following one is very slow and not recommended unless you have a GPU or very few documents
-ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert', descending=False)
+ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=True)
+ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count', descending=True)
+# SBERT is slower but higher quality on semantics; consider smaller batches
+ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert', descending=True)
 ```
 
 If you then want to post the ranked posts to a server, you can --- after having called `.rank()` simply call `.post()`:
@@ -47,6 +47,27 @@ If you then want to post the ranked posts to a server, you can --- after having 
 ranker3.post(test=False)
 ```
 **For this to work, you need to edit the file `blueskyranker/.env` in and add the server address (without https://) and the API-key. **
+
+We use `python-dotenv` to load these values; make sure it is installed (`pip install -r requirements.txt`).
+
+### Fetch and rank per handle
+You can fetch recent public posts, then run the topic ranker separately per handle. For example:
+
+```
+import polars as pl
+from blueskyranker.fetcher import Fetcher
+from blueskyranker.ranker import TopicRanker
+
+# Download recent public posts for default handles
+fetcher = Fetcher()
+print(fetcher.fetch())
+
+# Rank per handle using TF–IDF topical clustering
+df_nl = pl.read_csv('news-flows-nl_bsky_social_author_feed.csv')
+ranker = TopicRanker(returnformat='dataframe', method='networkclustering-tfidf', descending=True)
+ranking_nl = ranker.rank(df_nl)
+print(ranking_nl.head())
+```
 
 ## Demo of the whole pipeline
 Check out  `example.ipynb` to see how we first download the data and then rank it!

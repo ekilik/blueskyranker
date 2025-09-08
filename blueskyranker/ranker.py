@@ -27,6 +27,13 @@ load_dotenv(".env")
 
 
 class _BaseRanker():
+    """Base class for rankers.
+
+    - returnformat: one of 'id' | 'dicts' | 'dataframe'
+    - descending: when True, rankers should place the most important items FIRST.
+      The post() method preserves row order and assigns priority 0 to the first row
+      (lower numbers = higher priority on the feed API).
+    """
     def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric=None, descending = False):
         self.required_keys = None
         self.returnformat = returnformat
@@ -42,15 +49,18 @@ class _BaseRanker():
             return pl.from_dicts(data)
         elif type(data) is pl.DataFrame:
             if self.required_keys is not None:
-                assert self.required_keys.issubset(data.columns) , f"Not all required keys ({self.required_keys} are in the dataset (present keys: {data.columns}). Missing keys: {set(self.required_keys) - set(data.keys())}"
+                assert self.required_keys.issubset(data.columns), (
+                    f"Not all required keys ({self.required_keys}) are in the dataset "
+                    f"(present columns: {data.columns}). Missing keys: "
+                    f"{set(self.required_keys) - set(data.columns)}"
+                )
             return data
         else:
             raise ValueError("Data format not supported")
 
     def _transform_output(self, data):
-        if not self.descending:
-            data = data.reverse()  # The lower in the table, the more important in this case
-
+        # Do not change order here. Rankers must output final order
+        # (top row = highest priority = priority index 0).
         if self.returnformat == 'id':
             return data['uri'].to_list()
         elif self.returnformat == "dicts":
@@ -113,16 +123,29 @@ class PopularityRanker(_BaseRanker):
 
 
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
+        """Sorts by the selected engagement metric.
+
+        With descending=True, highest metric appears first (priority 0).
+        """
         df = self._transform_input(data)
-        df.sort(by=self.metric, descending=self.descending)
+        df = df.sort(by=self.metric, descending=self.descending)  # returns new DataFrame
         self.ranking = df
         return self._transform_output(df)
 
 
 class TopicRanker(_BaseRanker):
+    """Topic-driven ranker using text similarity + Leiden clustering.
+
+    method:
+      - 'networkclustering-tfidf'  : cosine over TF–IDF vectors
+      - 'networkclustering-count'  : cosine over raw counts
+      - 'networkclustering-sbert'  : cosine over SBERT embeddings
+
+    descending=True will prioritize posts from the most engaged clusters first.
+    """
     def __init__(self, 
             returnformat: Literal["id","dicts","dataframe"],
-            method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbertf'],
+            method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbert'],
             descending: bool,
             metric: Literal['like_count', 'quote_count',  'reply_count',  'repost_count', 'engagement'] = 'engagement'):
         self.required_keys = {'uri', 'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri'} 
@@ -182,7 +205,11 @@ class TopicRanker(_BaseRanker):
         return data
 
     def _add_cluster_stats(self, df_with_clusters):
-        """takes dataframe with cluster labels and adds cluster statistics"""
+        """Takes dataframe with cluster labels and adds cluster statistics.
+
+        engagement_rank is computed so that 1 = highest engagement within the dataset,
+        independent of the outer 'descending' flag.
+        """
         clusterstats = df_with_clusters.group_by('cluster').agg(pl.col('like_count').sum(),
             pl.col('reply_count').sum(),
             pl.col('quote_count').sum(),
@@ -190,7 +217,10 @@ class TopicRanker(_BaseRanker):
             pl.len())
         # TODO: MAYBE WEIGH THIS, SUCH THAT A LIKE COUNTS LESS THAN A REPLY?
         clusterstats = clusterstats.with_columns(sum=pl.sum_horizontal("reply_count", "like_count",'repost_count','quote_count'))
-        clusterstats = clusterstats.with_columns(engagement_rank=clusterstats["sum"].rank(method='random', descending=self.descending)).rename({'sum':'engagement_count', 'len':'size'}) 
+        # Lower engagement_rank means higher engagement; independent of outer descending
+        clusterstats = clusterstats.with_columns(
+            engagement_rank=clusterstats["sum"].rank(method='random', descending=True)
+        ).rename({'sum':'engagement_count', 'len':'size'}) 
         clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({"cluster_cluster": "cluster"})
         df_with_clusters = df_with_clusters.join(clusterstats, on="cluster")
         return df_with_clusters
@@ -221,9 +251,11 @@ class TopicRanker(_BaseRanker):
         # But we do sth more fancy:
         # We now return the articles sorted by the cluster engagement rank
 
-        df_with_clusters = df_with_clusters.sort(by='cluster_engagement_rank')
-        if not self.descending:
-            df_with_clusters = df_with_clusters.reverse()
+        # With engagement_rank defined as 1 = highest engagement, we put
+        # most-engaged clusters first when descending=True.
+        df_with_clusters = df_with_clusters.sort(
+            by='cluster_engagement_rank', descending=not self.descending
+        )
         
         # TODO: Implement saturation here, such that we do not have just the same things from the same cluster
         # TODO: (iteratively construct feed accounting for a topic saturation penalty (if post is already covered; see example below).)
@@ -278,7 +310,3 @@ if __name__=="__main__":
     print(ranking[-10:]) # show LAST 10 in this case
 
     ranker3.post()
-
-
-
-
