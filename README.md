@@ -52,6 +52,9 @@ python blueskyranker/fetcher.py \
   --handles news-flows-nl.bsky.social news-flows-ir.bsky.social news-flows-cz.bsky.social news-flows-fr.bsky.social \
   --max-age-days 7 --sqlite-path newsflows.db
 ```
+Notes:
+- Incremental by default: fetches newer posts since the latest saved timestamp, within the last N days.
+- Full refresh of the window: add `--refresh-window` to re‑fetch the entire N‑day window (updates engagement for all posts in that period).
 
 3) Rank per handle (TF‑IDF topic clustering example)
 ```
@@ -88,56 +91,19 @@ ranker.post(test=False)
 ```
 Set `FEEDGEN_HOSTNAME` and `PRIORITIZE_API_KEY` in `.env`. We use `python-dotenv` to load these.
 
-## Usage
+## Usage and Examples
 
-### Try it out!
-Just run `python3 blueskyranker/ranker.py` for a demo
+Priority semantics: the feed API treats LOWER numbers as higher priority (priority 0 is highest). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
 
-### Using it in your own script
-Let's first run a simple ranker that, in fact, doesn't rank but just returns the output
+Basic rankers (programmatic):
 ```
-from blueskyranker import TrivialRanker
+from blueskyranker import TrivialRanker, PopularityRanker
 
-ranker = TrivialRanker(returnformat='id')
-
-rankedposts = ranker.rank(data)
-```
-Here, `data` is either a polars dataframe or a list of dicts with the Bluesky-posts you want to rank.
-
-This ranker is set up such that it just returns the ids of the ranked posts. Alternatively, you can get the full posts, either as list of dicts, or as a polars dataframe by using `returnformat='dicts'`, or `returnformat='dataframe`.
-
-You can also rank by popularity:
-```
-from blueskyranker import PopularityRanker
-ranker = PopularityRanker(returnformat='dicts', metric= "reply_count", descending=True)  # or "like_count", etc.
+trivial = TrivialRanker(returnformat='id', metric=None, descending=True)
+popular = PopularityRanker(returnformat='dicts', metric='reply_count', descending=True)
 ```
 
-Finally, and most importantly, you can implement much more advanced rankers, like this one, that clusters all posts, and then ranks posts such that posts from much-engaged clusters (!) are ranked higher. (DETAILED DESCRIPTION TO FOLLOW)
-
-Priority semantics: our feed API treats LOWER numeric values as higher priority (priority 0 is highest). The rankers therefore keep the top item first. Use `descending=True` when you want the “most important” items (e.g., highest engagement/topic) at the top of the list.
-
-```
-from blueskyranker import TopicRanker
-    
-ranker1 = TopicRanker(returnformat='dataframe', method = 'networkclustering-tfidf', descending=True)
-ranker2 = TopicRanker(returnformat='dataframe', method = 'networkclustering-count', descending=True)
-# SBERT is slower but higher quality on semantics; consider smaller batches
-ranker3 = TopicRanker(returnformat='dataframe', method = 'networkclustering-sbert', descending=True)
-```
-
-Advanced parameters:
-- `similarity_threshold` (float, default 0.2): raise for fewer/tighter clusters.
-- `vectorizer_stopwords` ('english' | list[str] | None): stopwords for TF‑IDF/Count vectorizers.
-- Time windows (days): `cluster_window_days`, `engagement_window_days`, `push_window_days`.
-  - If provided, the fetch window should be at least the max of these values.
-
-If you then want to post the ranked posts to a server, you can --- after having called `.rank()` simply call `.post()`:
-```
-ranker3.post(test=False)
-```
-**For this to work, you need to edit the file `blueskyranker/.env` in and add the server address (without https://) and the API-key. **
-
-We use `python-dotenv` to load these values; make sure it is installed (`pip install -r requirements.txt`).
+TopicRanker (clusters + engagement ordering): see Quickstart and Time Windows sections for parameters.
 
 ### Fetch and rank per handle
 You can fetch recent public posts, then run the topic ranker separately per handle. For example:

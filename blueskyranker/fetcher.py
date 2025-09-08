@@ -546,16 +546,19 @@ class Fetcher():
         max_age_days=7,
         cutoff_check_every=1,
         include_pins=False,
-        sqlite_path: Optional[str] = None):
+        sqlite_path: Optional[str] = None,
+        refresh_window: bool = False,
+        ):
         """Fetch public Bluesky posts (SQLite only).
 
         Parameters:
 
         handles (list of strings): Bluesky handles to fetch
-        max_age_days (int): Only keep posts whose createdAt is within the last N days; pagination stops early when older content is reached.
+        max_age_days (int): Only keep posts whose createdAt is within the last N days.
         cutoff_check_every (int)": How many pages between early-stop checks against the cutoff (default: 1 = check every page).
         include_pins (bool): Include pinned posts at the top
         sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db)
+        refresh_window (bool): If True, re-fetch the entire N-day window even if posts already exist in DB (refresh engagement metrics). If False (default), fetch incrementally from the latest saved timestamp.
         """
 
         db_path = sqlite_path or "newsflows.db"
@@ -571,13 +574,17 @@ class Fetcher():
         for handle in handles_pbar:
             out_path = f"{handle.replace('.', '_')}_author_feed.csv"  # legacy filename for status messages only
 
-            # Incremental cutoff per handle:
-            # Use later of (now - N days) and latest saved createdAt in CSV (if present).
+            # Choose cutoff per handle
             cutoff_dt: Optional[datetime] = None
             if max_age_days is not None:
                 rel_cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-                latest_saved = latest_created_at_in_db(conn, handle)
-                cutoff_dt = max(latest_saved, rel_cutoff) if latest_saved else rel_cutoff
+                if refresh_window:
+                    # Refresh the entire window N days back
+                    cutoff_dt = rel_cutoff
+                else:
+                    # Incremental: only fetch newer than what we have
+                    latest_saved = latest_created_at_in_db(conn, handle)
+                    cutoff_dt = max(latest_saved, rel_cutoff) if latest_saved else rel_cutoff
 
             # Fetch rows for the handle
             handle_rows, stats = fetch_author_feed_all(
@@ -616,7 +623,7 @@ class Fetcher():
 def main():
     logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', datefmt='%H:%M:%S')
     logger.setLevel(logging.DEBUG)
-    parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, max-age cutoff, incremental updates, and embed extraction (SQLite storage).")
+    parser = argparse.ArgumentParser(description="Fetch public Bluesky posts with progress, time window cutoff, optional full-window refresh, and embed extraction (SQLite storage).")
     parser.add_argument(
         "--handles",
         nargs="+",
@@ -637,7 +644,7 @@ def main():
         "--max-age-days",
         type=int,
         default=7,
-        help="Only keep posts whose createdAt is within the last N days; pagination stops early when older content is reached."
+        help="Only keep posts whose createdAt is within the last N days (window cutoff)."
     )
     parser.add_argument(
         "--cutoff-check-every",
@@ -662,6 +669,11 @@ def main():
         default="newsflows.db",
         help="Path to SQLite database file."
     )
+    parser.add_argument(
+        "--refresh-window",
+        action="store_true",
+        help="Re-fetch the entire N-day window (refresh engagement), ignoring latest saved timestamp."
+    )
     parser.set_defaults(include_pins=False)
     args = parser.parse_args()
 
@@ -672,6 +684,7 @@ def main():
         cutoff_check_every=args.cutoff_check_every,
         include_pins=args.include_pins,
         sqlite_path=args.sqlite_path,
+        refresh_window=args.refresh_window,
     )
     print(results)
 
