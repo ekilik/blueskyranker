@@ -44,6 +44,7 @@ import csv
 import os
 import argparse
 import time
+import sqlite3
 from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -64,12 +65,67 @@ APPVIEW_XRPC = "https://public.api.bsky.app/xrpc"
 PAGE_LIMIT = 100
 SLEEP_SEC = 0.20  # polite pacing
 
+# Canonical post fields used for CSV and SQLite
 CSV_HEADERS = [
     "uri","cid","author_handle","author_did","indexedAt","createdAt","text",
     "reply_root_uri","reply_parent_uri","is_repost",
     "like_count","repost_count","reply_count","quote_count",
     "news_title","news_description","news_uri"
 ]
+
+# SQLite helpers
+def ensure_db(path: str) -> sqlite3.Connection:
+    """Open or create the SQLite DB with required schema."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS posts (
+            uri TEXT PRIMARY KEY,
+            cid TEXT,
+            author_handle TEXT,
+            author_did TEXT,
+            indexedAt TEXT,
+            createdAt TEXT,
+            text TEXT,
+            reply_root_uri TEXT,
+            reply_parent_uri TEXT,
+            is_repost INTEGER,
+            like_count INTEGER,
+            repost_count INTEGER,
+            reply_count INTEGER,
+            quote_count INTEGER,
+            news_title TEXT,
+            news_description TEXT,
+            news_uri TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_handle)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(createdAt)")
+    return conn
+
+def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
+    """Upsert rows by uri. Returns number of rows affected (inserted or updated)."""
+    if not rows:
+        return 0
+    cols = CSV_HEADERS
+    placeholders = ",".join([":"+c for c in cols])
+    update_clause = ",".join([f"{c}=excluded.{c}" for c in cols if c != "uri"])  # leave PK as-is
+    sql = f"""
+        INSERT INTO posts ({','.join(cols)}) VALUES ({placeholders})
+        ON CONFLICT(uri) DO UPDATE SET {update_clause}
+    """
+    with conn:
+        conn.executemany(sql, rows)
+    return len(rows)
+
+def latest_created_at_in_db(conn: sqlite3.Connection, handle: str) -> Optional[datetime]:
+    cur = conn.execute("SELECT MAX(createdAt) FROM posts WHERE author_handle=?", (handle,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    max_created = row[0]
+    return iso_to_dt(max_created) if max_created else None
 
 def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -405,7 +461,10 @@ def final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
 
 
 class Fetcher():
-    """Fetcher to get public Bluesky posts with max-age cutoff, incremental updates, and embed extraction."""
+    """Fetcher to get public Bluesky posts with max-age cutoff, incremental updates, and embed extraction.
+
+    Supports writing to CSV (append + de-dup) or SQLite (upsert by uri).
+    """
     def __init__(self, xrpc_base=APPVIEW_XRPC):
         self.client = Client(xrpc_base)
 
@@ -417,7 +476,9 @@ class Fetcher():
         ],
         max_age_days=7,
         cutoff_check_every=1,
-        include_pins=False):
+        include_pins=False,
+        storage: str = "csv",
+        sqlite_path: Optional[str] = None):
         """Fetch public Bluesky posts.
 
         Parameters:
@@ -426,7 +487,15 @@ class Fetcher():
         max_age_days (int): Only keep posts whose createdAt is within the last N days; pagination stops early when older content is reached.
         cutoff_check_every (int)": How many pages between early-stop checks against the cutoff (default: 1 = check every page).
         include_pins (bool): Include pinned posts at the top
+        storage (str): 'csv' (default) or 'sqlite'
+        sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db) when storage='sqlite'
         """
+
+        assert storage in {"csv", "sqlite"}, "storage must be 'csv' or 'sqlite'"
+        conn: Optional[sqlite3.Connection] = None
+        if storage == "sqlite":
+            db_path = sqlite_path or "newsflows.db"
+            conn = ensure_db(db_path)
 
         posts_pbar = tqdm(desc="Posts fetched (all handles)", unit="post", dynamic_ncols=True)
         combined_new_rows: List[Dict[str, Any]] = []
@@ -438,15 +507,19 @@ class Fetcher():
         for handle in handles_pbar:
             out_path = f"{handle.replace('.', '_')}_author_feed.csv"
 
-            # Ensure header exists before reading
-            _ = ensure_headers(out_path)
+            if storage == "csv":
+                # Ensure header exists before reading
+                _ = ensure_headers(out_path)
 
             # Incremental cutoff per handle:
             # Use later of (now - N days) and latest saved createdAt in CSV (if present).
             cutoff_dt: Optional[datetime] = None
             if max_age_days is not None:
                 rel_cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-                latest_saved = latest_created_at_in_csv(out_path)
+                if storage == "csv":
+                    latest_saved = latest_created_at_in_csv(out_path)
+                else:
+                    latest_saved = latest_created_at_in_db(conn, handle) if conn else None
                 cutoff_dt = max(latest_saved, rel_cutoff) if latest_saved else rel_cutoff
 
             # Fetch rows for the handle
@@ -459,29 +532,36 @@ class Fetcher():
                 cutoff_check_every=cutoff_check_every,
             )
 
-            # Prepare append with de-dup
-            existing_uris = load_existing_uris(out_path)
-            new_rows = [r for r in handle_rows if r.get("uri") and r["uri"] not in existing_uris]
-
-            # Append only new rows
-            append_rows(out_path, new_rows)
-
-            # Track combined (only newly added this run)
-            combined_new_rows.extend(new_rows)
+            if storage == "csv":
+                # Prepare append with de-dup
+                existing_uris = load_existing_uris(out_path)
+                new_rows = [r for r in handle_rows if r.get("uri") and r["uri"] not in existing_uris]
+                # Append only new rows
+                append_rows(out_path, new_rows)
+                combined_new_rows.extend(new_rows)
+            else:
+                # Upsert all rows for this handle
+                affected = upsert_rows(conn, handle_rows)
+                combined_new_rows.extend(handle_rows)
 
             # Report: how many NEW and their time frame
-            if new_rows:
-                dts = [iso_to_dt(r.get("createdAt")) for r in new_rows if r.get("createdAt")]
-                dts = [d for d in dts if d is not None]
-                new_min = min(dts).isoformat() if dts else None
-                new_max = max(dts).isoformat() if dts else None
-                handles_pbar.write(
-                    f"✅ DONE {handle}: added {len(new_rows)} new posts "
-                    f"({new_min} → {new_max}) → {out_path}"
-                )
+            if storage == "csv":
+                if new_rows:
+                    dts = [iso_to_dt(r.get("createdAt")) for r in new_rows if r.get("createdAt")]
+                    dts = [d for d in dts if d is not None]
+                    new_min = min(dts).isoformat() if dts else None
+                    new_max = max(dts).isoformat() if dts else None
+                    handles_pbar.write(
+                        f"✅ DONE {handle}: added {len(new_rows)} new posts "
+                        f"({new_min} → {new_max}) → {out_path}"
+                    )
+                else:
+                    handles_pbar.write(
+                        f"✅ DONE {handle}: no new posts to append → {out_path}"
+                    )
             else:
                 handles_pbar.write(
-                    f"✅ DONE {handle}: no new posts to append → {out_path}"
+                    f"✅ DONE {handle}: upserted {len(handle_rows)} posts into SQLite"
                 )
 
             # Keep scrape stats (before de-dup)
@@ -490,17 +570,22 @@ class Fetcher():
         elapsed_all = time.perf_counter() - start_all
         posts_pbar.close()
 
-        # Combined CSV: append only newly added rows across all handles in this run.
-        combined_path = "all_handles_author_feed.csv"
-        ensure_headers(combined_path)
-        existing_combined_uris = load_existing_uris(combined_path)
-        combined_to_append = [r for r in combined_new_rows if r["uri"] not in existing_combined_uris]
-        append_rows(combined_path, combined_to_append)
+        if storage == "csv":
+            # Combined CSV: append only newly added rows across all handles in this run.
+            combined_path = "all_handles_author_feed.csv"
+            ensure_headers(combined_path)
+            existing_combined_uris = load_existing_uris(combined_path)
+            combined_to_append = [r for r in combined_new_rows if r["uri"] not in existing_combined_uris]
+            append_rows(combined_path, combined_to_append)
 
-        logger.debug(
-            f"\nWrote/updated combined CSV with +{len(combined_to_append)} new rows → {combined_path} "
-            f"({elapsed_all:.2f}s total)."
-        )
+            logger.debug(
+                f"\nWrote/updated combined CSV with +{len(combined_to_append)} new rows → {combined_path} "
+                f"({elapsed_all:.2f}s total)."
+            )
+        else:
+            logger.debug(
+                f"\nSQLite upsert complete → {sqlite_path or 'newsflows.db'} ({elapsed_all:.2f}s total)."
+            )
 
         # Final detailed report for the run (scraped rows prior to de-dup)
         return final_report(per_handle_stats)
@@ -549,11 +634,29 @@ def main():
         action="store_false",
         help="Exclude pinned posts (default)."
     )
+    parser.add_argument(
+        "--storage",
+        choices=["csv", "sqlite"],
+        default="csv",
+        help="Where to persist results: 'csv' (default) or 'sqlite' (upsert by uri)."
+    )
+    parser.add_argument(
+        "--sqlite-path",
+        default="newsflows.db",
+        help="Path to SQLite database file (when --storage=sqlite)."
+    )
     parser.set_defaults(include_pins=False)
     args = parser.parse_args()
 
     fetcher = Fetcher(args.xrpc_base)
-    results = fetcher.fetch(handles = args.handles, max_age_days=args.max_age_days, cutoff_check_every=args.cutoff_check_every, include_pins=args.include_pins)
+    results = fetcher.fetch(
+        handles = args.handles,
+        max_age_days=args.max_age_days,
+        cutoff_check_every=args.cutoff_check_every,
+        include_pins=args.include_pins,
+        storage=args.storage,
+        sqlite_path=args.sqlite_path,
+    )
     print(results)
 
    
