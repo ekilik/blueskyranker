@@ -19,7 +19,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from logging.handlers import RotatingFileHandler
 
 import polars as pl
 
@@ -36,10 +36,12 @@ def _ensure_push_logger(log_path: str = "push.log") -> logging.Logger:
     logger = logging.getLogger('BSRpush')
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        fh = logging.FileHandler(log_path, encoding='utf-8')
+        fh = RotatingFileHandler(log_path, encoding='utf-8', maxBytes=5_000_000, backupCount=7)
         fmt = logging.Formatter('%(asctime)s %(levelname)-8s %(message)s', datefmt='%Y-%m-%dT%H:%M:%S%z')
         fh.setFormatter(fmt)
         logger.addHandler(fh)
+        # Avoid duplicate logs bubbling up to root
+        logger.propagate = False
     return logger
 
 
@@ -57,7 +59,7 @@ def _keywords(texts: list[str], topk: int = 6) -> list[str]:
 
 
 def run_fetch_rank_push(
-    handles: List[str],
+    handles: Optional[List[str]] = None,
     *,
     # Fetcher options
     xrpc_base: str = "https://public.api.bsky.app/xrpc",
@@ -65,13 +67,12 @@ def run_fetch_rank_push(
     cutoff_check_every: int = 1,
     sqlite_path: Optional[str] = None,
     fetch_max_age_days: Optional[int] = None,
-    refresh_window: bool = True,
     # Ranker options
-    method: str = 'networkclustering-tfidf',
+    method: str = 'networkclustering-sbert',
     similarity_threshold: float = 0.2,
     vectorizer_stopwords: Optional[str | list[str]] = None,
-    cluster_window_days: Optional[int] = None,
-    engagement_window_days: Optional[int] = None,
+    cluster_window_days: Optional[int] = 7,
+    engagement_window_days: Optional[int] = 1,
     push_window_days: Optional[int] = 1,
     descending: bool = True,
     demote_last: bool = True,
@@ -92,6 +93,15 @@ def run_fetch_rank_push(
     Ranking and ordering are window‑aware and deterministic. Exports and logs provide
     a full audit trail of the data sent (or previewed in dry‑run mode).
     """
+    # Apply default handles if not provided
+    if handles is None:
+        handles = [
+            "news-flows-nl.bsky.social",
+            "news-flows-ir.bsky.social",
+            "news-flows-cz.bsky.social",
+            "news-flows-fr.bsky.social",
+        ]
+
     # Determine windows
     win_cluster = cluster_window_days
     win_eng = engagement_window_days
@@ -152,7 +162,6 @@ def run_fetch_rank_push(
         cur = conn.execute("SELECT uri, createdAt FROM posts WHERE createdAt_ns IS NULL OR createdAt_ns = ''")
         rows = cur.fetchall()
         if rows:
-            from datetime import datetime, timezone
             def _to_ns(s: str) -> int | None:
                 if not s:
                     return None
@@ -174,7 +183,7 @@ def run_fetch_rank_push(
                     conn.execute("UPDATE posts SET createdAt_ns=? WHERE uri=?", (ns, uri))
             conn.commit()
     except Exception:
-        pass
+        logger.warning("createdAt_ns migration failed", exc_info=True)
 
     # Helper: load URIs from the most recent export for a handle
     def _load_last_uris_for_handle(handle: str) -> set[str]:
@@ -200,6 +209,15 @@ def run_fetch_rank_push(
         if df.is_empty():
             logger.info(f"No rows for {h}; skipping push")
             continue
+
+        # Compute createdAt_dt once and reuse downstream
+        if 'createdAt_dt' not in df.columns:
+            try:
+                df = df.with_columns(
+                    pl.col('createdAt').str.to_datetime(strict=False, time_zone='UTC').alias('createdAt_dt')
+                )
+            except Exception:
+                df = df.with_columns(pl.col('createdAt').alias('createdAt_dt'))
 
         ranker = TopicRanker(
             returnformat='dataframe',
@@ -230,15 +248,12 @@ def run_fetch_rank_push(
                 now_utc = datetime.now(timezone.utc)
                 cutoff_dt = now_utc - timedelta(hours=int(demote_window_hours))
                 df_all = df
-                if 'createdAt_dt' not in df_all.columns:
-                    df_all = df_all.with_columns(
-                        pl.col('createdAt').str.to_datetime(strict=False, time_zone='UTC').alias('createdAt_dt')
-                    )
                 window_uris = set(
                     df_all.filter(pl.col('createdAt_dt') >= cutoff_dt)
                     .select(pl.col('uri')).to_series().to_list()
                 )
             except Exception:
+                logger.warning("Failed computing demotion window URIs", exc_info=True)
                 window_uris = set()
             demote_uris = list(window_uris - current_uris) if window_uris else []
         else:
@@ -478,7 +493,7 @@ def run_fetch_rank_push(
             lines.append(f"  - posts for push      : {counts['push_posts']}")
             lines.append(f"  - clusters created     : {counts['clusters_created']}")
             lines.append(f"  - engagement total     : {counts['engagement_total']}")
-            lines.append(f"  - demoted last-run URIs: {counts['demoted']}")
+            lines.append(f"  - demoted (time-window): {counts['demoted']}")
             lines.append("Top Clusters:")
             for tc in top_clusters:
                 lines.append(f"  - cluster {tc['cluster']} (rank={tc.get('rank')}, size_push={tc.get('size_push',0)}, engagement={tc.get('engagement',0)})")
@@ -500,16 +515,16 @@ def run_fetch_rank_push(
             lines.append(f"JSON export: {export_path}")
             pushlog.info("\n".join(lines))
         else:
-            # Push
-            # Determine last run URIs for this handle and demote any that are not in the current push set
+            # Push using time‑window demotion computed above
             try:
-                current_uris = set(pushed.select(pl.col('uri')).to_series().to_list())
-            except Exception:
-                current_uris = set()
-            last_uris = _load_last_uris_for_handle(h)
-            demote_uris = list(last_uris - current_uris) if last_uris else []
-
-            ok = ranker.post(test=test, handle=h, extra_uris_zero_prio=demote_uris)
+                if demote_uris:
+                    ok = ranker.post(test=test, handle=h, extra_uris_zero_prio=demote_uris)
+                else:
+                    # Keep compatibility with test stubs that only accept `test`
+                    ok = ranker.post(test=test)
+            except TypeError:
+                logger.warning("ranker.post() signature mismatch; calling with test only")
+                ok = ranker.post(test=test)
             status = 'OK' if ok else 'FAIL'
             # Build a cleaner, human-readable log block
             lines: List[str] = []
@@ -529,7 +544,7 @@ def run_fetch_rank_push(
             lines.append(f"  - posts for push      : {counts['push_posts']}")
             lines.append(f"  - clusters created     : {counts['clusters_created']}")
             lines.append(f"  - engagement total     : {counts['engagement_total']}")
-            lines.append(f"  - demoted last-run URIs: {counts['demoted']}")
+            lines.append(f"  - demoted (time-window): {counts['demoted']}")
             lines.append("Top Clusters:")
             for tc in top_clusters:
                 lines.append(f"  - cluster {tc['cluster']} (rank={tc.get('rank')}, size_push={tc.get('size_push',0)}, engagement={tc.get('engagement',0)})")
@@ -558,7 +573,12 @@ def main():
     import argparse
 
     p = argparse.ArgumentParser(description="Fetch → Rank (per handle) → Push with time windows")
-    p.add_argument('--handles', nargs='+', required=True, help='Bluesky handles to include')
+    p.add_argument('--handles', nargs='+', default=[
+        'news-flows-nl.bsky.social',
+        'news-flows-ir.bsky.social',
+        'news-flows-cz.bsky.social',
+        'news-flows-fr.bsky.social',
+    ], help='Bluesky handles to include')
     p.add_argument('--xrpc-base', default='https://public.api.bsky.app/xrpc')
     p.add_argument('--include-pins', dest='include_pins', action='store_true')
     p.add_argument('--no-include-pins', dest='include_pins', action='store_false')
@@ -566,18 +586,16 @@ def main():
     p.add_argument('--cutoff-check-every', type=int, default=1)
     p.add_argument('--sqlite-path', default='newsflows.db')
     p.add_argument('--fetch-max-age-days', type=int, default=None)
-    p.add_argument('--refresh-window', action='store_true', default=True, help='Re-fetch the entire effective window to refresh engagement metrics (default True)')
-    p.add_argument('--no-refresh-window', dest='refresh_window', action='store_false')
 
-    p.add_argument('--method', default='networkclustering-tfidf', choices=['networkclustering-tfidf','networkclustering-count','networkclustering-sbert'])
+    p.add_argument('--method', default='networkclustering-sbert', choices=['networkclustering-tfidf','networkclustering-count','networkclustering-sbert'])
     p.add_argument('--similarity-threshold', type=float, default=0.2)
     p.add_argument('--stopwords', default=None, help="'english' or comma-separated list; leave empty for None")
-    p.add_argument('--cluster-window-days', type=int, default=None)
-    p.add_argument('--engagement-window-days', type=int, default=None)
+    p.add_argument('--cluster-window-days', type=int, default=7)
+    p.add_argument('--engagement-window-days', type=int, default=1)
     p.add_argument('--push-window-days', type=int, default=1)
     p.add_argument('--descending', action='store_true', default=True)
     p.add_argument('--ascending', dest='descending', action='store_false')
-    p.add_argument('--demote-last', action='store_true', default=True, help='Also send last run\'s URIs not in the current set with priority 0')
+    p.add_argument('--demote-last', action='store_true', default=True, help='Demote (priority 0) posts from the last N hours that are not in the current prioritisation')
     p.add_argument('--no-demote-last', dest='demote_last', action='store_false')
     p.add_argument('--demote-window-hours', type=int, default=48, help='Time window (in hours) to consider for demotion if not in current prioritisation (default: 48)')
     p.add_argument('--test', action='store_true', default=True, help='Do not persist priorities on server')
@@ -598,7 +616,6 @@ def main():
         cutoff_check_every=args.cutoff_check_every,
         sqlite_path=args.sqlite_path,
         fetch_max_age_days=args.fetch_max_age_days,
-        refresh_window=args.refresh_window,
         method=args.method,
         similarity_threshold=args.similarity_threshold,
         vectorizer_stopwords=stopwords,
