@@ -20,7 +20,6 @@ import os
 import requests
 import json
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 
 
@@ -53,18 +52,18 @@ class _BaseRanker():
         self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
 
     def _transform_input(self, data) -> pl.DataFrame:
-        """not fully implemented yet, ensure that we can process dataframes but also list of dicts """
-        if type(data) is list:
-            if self.required_keys is not None:
-                assert self.required_keys.issubset(data[0].keys()), f"Not all required keys ({self.required_keys} are in the dataset (present keys: {data[0].keys()}). Missing keys: {set(self.required_keys) - set(data[0].keys())}" 
+        """Ensure we can process DataFrames and list[dict]; validate required keys; handle empty lists."""
+        if isinstance(data, list):
+            if not data:
+                return pl.DataFrame([])
+            if self.required_keys is not None and not self.required_keys.issubset(set(data[0].keys())):
+                missing = set(self.required_keys) - set(data[0].keys())
+                raise ValueError(f"Missing required keys: {missing}; present: {set(data[0].keys())}")
             return pl.from_dicts(data)
-        elif type(data) is pl.DataFrame:
-            if self.required_keys is not None:
-                assert self.required_keys.issubset(data.columns), (
-                    f"Not all required keys ({self.required_keys}) are in the dataset "
-                    f"(present columns: {data.columns}). Missing keys: "
-                    f"{set(self.required_keys) - set(data.columns)}"
-                )
+        elif isinstance(data, pl.DataFrame):
+            if self.required_keys is not None and not self.required_keys.issubset(set(data.columns)):
+                missing = set(self.required_keys) - set(data.columns)
+                raise ValueError(f"Missing required columns: {missing}; present: {set(data.columns)}")
             return data
         else:
             raise ValueError("Data format not supported")
@@ -96,11 +95,15 @@ class _BaseRanker():
         Parameters:
         test (bool): If True, only does a test run without changing the database
         """
-        server = f"https://{os.getenv('FEEDGEN_HOSTNAME', 'localhost:3020')}"
-        headers = {"api-key": os.getenv("PRIORITIZE_API_KEY")}
+        host = os.getenv('FEEDGEN_HOSTNAME', 'localhost:3020')
+        scheme = 'http' if host.startswith('localhost') or host.startswith('127.0.0.1') else 'https'
+        server = f"{scheme}://{host}"
+        api_key = os.getenv("PRIORITIZE_API_KEY")
+        headers = {"api-key": api_key} if api_key else {}
         params = {"test": str(test).lower()}
 
-        assert self.ranking is not None, "You need to call .rank() first to rank the posts before you can post them"
+        if self.ranking is None:
+            raise RuntimeError("You need to call .rank() first to rank the posts before you can post them")
         
         # Build priority list so that HIGHER numbers mean HIGHER priority.
         # Preserve current row order, then assign priorities starting at 1000:
@@ -112,6 +115,15 @@ class _BaseRanker():
             pl.when(pl.col('priority') < 1).then(1).otherwise(pl.col('priority')).alias('priority')
         ).select(['priority','uri'])
         post_list = df.rows(named=True)
+        # Payload size guard (warn only). Override via PRIORITIZE_MAX_ITEMS env.
+        try:
+            max_items = int(os.getenv('PRIORITIZE_MAX_ITEMS', '3000'))
+        except Exception:
+            max_items = 3000
+        if len(post_list) > max_items:
+            msg = f"Preparing to send {len(post_list)} items (> {max_items}). This may be slow or rejected by server."
+            logger.warning(msg)
+            print(f"[WARN] {msg}")
         # Optionally add extra URIs (typically from last run) with priority 0 to demote them
         if extra_uris_zero_prio:
             current_uris = {row['uri'] for row in post_list}
@@ -125,7 +137,11 @@ class _BaseRanker():
         logger.debug(f"Sending this post_list:\n{post_list}")
         # Perform request and capture/print/save any server response
         try:
-            resp = requests.post(f"{server}/api/prioritize", headers=headers, params=params, json=post_list)
+            resp = requests.post(f"{server}/api/prioritize", headers=headers, params=params, json=post_list, timeout=30)
+        except requests.exceptions.Timeout as e:
+            logger.error(f"POST to {server}/api/prioritize timed out: {e}")
+            print(f"[ERROR] POST timed out: {e}")
+            return False
         except requests.exceptions.RequestException as e:
             logger.error(f"POST to {server}/api/prioritize failed: {e}")
             print(f"[ERROR] POST failed: {e}")
@@ -243,7 +259,7 @@ class TopicRanker(_BaseRanker):
             engagement_window_days: int | None = None,
             push_window_days: int | None = None,
         ):
-        self.required_keys = {'uri', 'cid', 'like_count',  'news_description',  'news_title',  'news_uri',  'quote_count',  'reply_count',  'repost_count',  'text',  'uri', 'createdAt'} 
+        self.required_keys = {'uri', 'cid', 'like_count', 'news_description', 'news_title', 'news_uri', 'quote_count', 'reply_count', 'repost_count', 'text', 'createdAt'}
         self.returnformat = returnformat
         if metric != 'engagement':
             raise NotImplementedError
@@ -267,21 +283,30 @@ class TopicRanker(_BaseRanker):
         """
         logger.debug("Creating cosine similarity matrix...")
         if similarity =='tfidf-cosine':
-            vectorizer = TfidfVectorizer(stop_words=self.stopwords)   
-            bow = vectorizer.fit_transform(data['text'])
+            vectorizer = TfidfVectorizer(stop_words=self.stopwords)
+            texts = data['text'].fill_null('').to_list()
+            bow = vectorizer.fit_transform(texts)
             sim_matrix = cosine_similarity(bow)
         elif similarity =='count-cosine':
-            vectorizer = CountVectorizer(stop_words=self.stopwords)   
-            bow = vectorizer.fit_transform(data['text'])
+            vectorizer = CountVectorizer(stop_words=self.stopwords)
+            texts = data['text'].fill_null('').to_list()
+            bow = vectorizer.fit_transform(texts)
             sim_matrix = cosine_similarity(bow)
         elif similarity == 'sbert-cosine':
             # import here to avoid forcing everyone to install this huge library
             from sentence_transformers import SentenceTransformer
-            sbert_model = SentenceTransformer('sentence-transformers/distiluse-base-multilingual-cased-v2',  model_kwargs={"torch_dtype": "float16"})
-            embeddings = sbert_model.encode(data['text'], show_progress_bar=True)
+            model_name = 'sentence-transformers/distiluse-base-multilingual-cased-v2'
+            try:
+                import torch
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                sbert_model = SentenceTransformer(model_name, device=device)
+            except Exception:
+                sbert_model = SentenceTransformer(model_name)
+            texts = data['text'].fill_null('').to_list()
+            embeddings = sbert_model.encode(texts, show_progress_bar=True)
             sim_matrix = cosine_similarity(embeddings)
         else:
-            raise NotImplementedError(f"Simiarity {similarity} is not implemented")
+            raise NotImplementedError(f"Similarity {similarity} is not implemented")
 
         logger.debug(f"Removing all entries below a threshold of {self.similarity_threshold}")
         filtered_matrix = np.where(sim_matrix >= self.similarity_threshold, sim_matrix, 0)
@@ -400,8 +425,8 @@ class TopicRanker(_BaseRanker):
             df_with_clusters = self._cluster(df_cluster_base, similarity='count-cosine')
         if self.method == 'networkclustering-sbert':
             if len(df_cluster_base)>100:
-                logger.warning(f"Do you really want to do this? You have {len(df_cluster_base)} texts, calculating sentence embeddings will be REALLY slow")
-                logger.warning(f"Consider using another method, or submitting less document")
+                logger.warning(f"Do you really want to do this? You have {len(df_cluster_base)} texts; calculating sentence embeddings will be REALLY slow")
+                logger.warning(f"Consider using another method, or submitting fewer documents")
             df_with_clusters = self._cluster(df_cluster_base, similarity='sbert-cosine')
         # Count clusters created over the clustered set (before any push-window filter)
         try:
@@ -469,6 +494,7 @@ class TopicRanker(_BaseRanker):
                 .to_list()
             )
         except Exception:
+            logger.warning("Failed to compute cluster order; falling back to empty order", exc_info=True)
             cluster_order = []
 
         # For each cluster in order, collect its eligible rows sorted by recency (freshest first)
@@ -494,7 +520,7 @@ class TopicRanker(_BaseRanker):
             push_sizes = eligible.group_by('cluster').agg(pl.len().alias('cluster_size_push'))
             final_ranking = final_ranking.join(push_sizes, on='cluster', how='left')
         except Exception:
-            pass
+            logger.warning("Failed to join push-window cluster sizes", exc_info=True)
 
         self.ranking = final_ranking
         try:
