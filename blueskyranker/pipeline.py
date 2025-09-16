@@ -57,6 +57,7 @@ def run_fetch_rank_push(
     cutoff_check_every: int = 1,
     sqlite_path: Optional[str] = None,
     fetch_max_age_days: Optional[int] = None,
+    refresh_window: bool = True,
     # Ranker options
     method: str = 'networkclustering-tfidf',
     similarity_threshold: float = 0.2,
@@ -90,6 +91,7 @@ def run_fetch_rank_push(
         cutoff_check_every=cutoff_check_every,
         include_pins=include_pins,
         sqlite_path=sqlite_path,
+        refresh_window=refresh_window,
     )
 
     db_path = sqlite_path or 'newsflows.db'
@@ -164,14 +166,24 @@ def run_fetch_rank_push(
             demote_uris = []
         demoted_count = len(demote_uris)
         # Compute simple cluster stats
+        # Compute cluster engagement on the pushed subset using the same definition
+        # as the ranker (sum per metric with nulls treated as 0, then sum horizontally).
         agg = (
             pushed.group_by('cluster')
             .agg([
                 pl.len().alias('size'),
-                (pl.col('like_count') + pl.col('reply_count') + pl.col('quote_count') + pl.col('repost_count')).sum().alias('engagement'),
+                pl.col('like_count').fill_null(0).sum().alias('like_sum'),
+                pl.col('reply_count').fill_null(0).sum().alias('reply_sum'),
+                pl.col('quote_count').fill_null(0).sum().alias('quote_sum'),
+                pl.col('repost_count').fill_null(0).sum().alias('repost_sum'),
+                pl.col('cluster_engagement_rank').min().alias('cluster_engagement_rank'),
                 pl.col('news_title').drop_nulls().head(60).alias('titles'),
                 pl.col('text').drop_nulls().head(60).alias('texts'),
             ])
+            .with_columns(
+                engagement=pl.sum_horizontal('like_sum','reply_sum','quote_sum','repost_sum')
+            )
+            .drop(['like_sum','reply_sum','quote_sum','repost_sum'])
             .sort(['engagement','size'], descending=[True, True])
         )
 
@@ -191,6 +203,7 @@ def run_fetch_rank_push(
                 'cluster': cid,
                 'size': int(row['size']) if row['size'] is not None else 0,
                 'engagement': int(row['engagement']) if row['engagement'] is not None else 0,
+                'rank': int(row['cluster_engagement_rank']) if row.get('cluster_engagement_rank') is not None else None,
                 'keywords': kws,
             })
             try:
@@ -454,6 +467,8 @@ def main():
     p.add_argument('--cutoff-check-every', type=int, default=1)
     p.add_argument('--sqlite-path', default='newsflows.db')
     p.add_argument('--fetch-max-age-days', type=int, default=None)
+    p.add_argument('--refresh-window', action='store_true', default=True, help='Re-fetch the entire effective window to refresh engagement metrics (default True)')
+    p.add_argument('--no-refresh-window', dest='refresh_window', action='store_false')
 
     p.add_argument('--method', default='networkclustering-tfidf', choices=['networkclustering-tfidf','networkclustering-count','networkclustering-sbert'])
     p.add_argument('--similarity-threshold', type=float, default=0.2)
@@ -484,6 +499,7 @@ def main():
         cutoff_check_every=args.cutoff_check_every,
         sqlite_path=args.sqlite_path,
         fetch_max_age_days=args.fetch_max_age_days,
+        refresh_window=args.refresh_window,
         method=args.method,
         similarity_threshold=args.similarity_threshold,
         vectorizer_stopwords=stopwords,

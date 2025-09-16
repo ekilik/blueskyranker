@@ -193,6 +193,7 @@ python -m blueskyranker.pipeline \
   --push-window-days 1 \
   --demote-last \
   --demote-window-hours 48 \
+  --refresh-window \
   --log-path push.log \
   --no-test
 ```
@@ -327,6 +328,13 @@ Push exports are written to `push_exports/` with a human-readable UTC timestamp:
 push_{handle}_{YYYY-MM-DDTHH-mm-ssZ}.json
 ```
 For example: `push_news-flows-nl_bsky_social_2025-09-15T14-50-24Z.json`.
+
+### Fetch behavior (engagement refresh)
+
+The pipeline’s fetch step refreshes engagement metrics for all posts within the effective window by default. The effective fetch window is `max(cluster_window_days, engagement_window_days, push_window_days)` unless overridden via `--fetch-max-age-days`.
+
+- Default: `--refresh-window` is enabled, which re-fetches the entire effective window and upserts to SQLite (updating likes/replies/quotes/reposts).
+- To opt out (incremental only): pass `--no-refresh-window` (will fetch only posts newer than the latest in DB and not refresh older rows inside the window).
 
 ## Data Schema (SQLite)
 Table `posts` (upsert by `uri`):
