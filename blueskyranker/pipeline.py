@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-End-to-end pipeline: fetch → rank (per handle) → push, with user-controlled
-time windows for clustering, engagement ranking, and push.
+End‑to‑end pipeline: fetch → rank (per handle) → push, with user‑controlled
+time windows and robust, auditable behavior.
 
-Also provides a CLI.
+Highlights:
+- Two‑phase fetch: refresh engagement window (and push window if larger) so
+  engagement counts used for ranking are current; then extend to the clustering
+  window incrementally to provide graph context without refreshing older rows.
+- Ranking uses the TopicRanker which applies deterministic tie‑breaks and interleaves
+  the most recent posts from the most engaged clusters first (within the push window).
+- JSON export contains a complete trace (windows, counts, top clusters, items).
+  Items include UTC timestamps and a human‑readable local timestamp for validation.
 """
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -73,29 +81,100 @@ def run_fetch_rank_push(
     dry_run: bool = False,
     log_path: str = 'push.log',
 ) -> None:
-    """Fetch posts, rank per handle, and push ranked posts to the API per handle.
+    """Fetch posts, rank per handle, and optionally push ranked posts.
 
-    - fetch_max_age_days: if None, uses max(cluster_window_days, engagement_window_days, push_window_days).
-    - push_window_days defaults to 1 (24h), as commonly desired.
+    The function performs a two‑phase fetch by default:
+    1) Refresh engagement/push window to update engagement (likes/replies/quotes/reposts)
+       that actually matters for ranking.
+    2) Extend to the clustering window incrementally to provide sufficient context
+       for topic clustering without refreshing older rows.
+
+    Ranking and ordering are window‑aware and deterministic. Exports and logs provide
+    a full audit trail of the data sent (or previewed in dry‑run mode).
     """
-    # Determine how far back we need to fetch to cover all windows
-    windows = [w for w in [cluster_window_days, engagement_window_days, push_window_days] if w is not None]
-    effective_fetch_days = fetch_max_age_days if fetch_max_age_days is not None else (max(windows) if windows else 7)
+    # Determine windows
+    win_cluster = cluster_window_days
+    win_eng = engagement_window_days
+    win_push = push_window_days
+    # For engagement refresh, use the max of engagement/push (whichever is broader and matters for ranking)
+    refresh_days = max([w for w in [win_eng, win_push] if w is not None], default=None)
+    # Cluster context window: fallback to refresh_days if cluster window not provided
+    cluster_days = win_cluster if win_cluster is not None else refresh_days
+    # If user overrides max age via CLI, cap both phases accordingly
+    if fetch_max_age_days is not None:
+        if refresh_days is None:
+            refresh_days = fetch_max_age_days
+        else:
+            refresh_days = min(refresh_days, fetch_max_age_days)
+        if cluster_days is None:
+            cluster_days = fetch_max_age_days
+        else:
+            cluster_days = min(cluster_days, fetch_max_age_days)
+    # Sensible defaults if everything is None
+    if refresh_days is None and cluster_days is None:
+        refresh_days = 7
+        cluster_days = 7
 
     pushlog = _ensure_push_logger(log_path)
 
     fetcher = Fetcher(xrpc_base)
-    fetcher.fetch(
-        handles=handles,
-        max_age_days=effective_fetch_days,
-        cutoff_check_every=cutoff_check_every,
-        include_pins=include_pins,
-        sqlite_path=sqlite_path,
-        refresh_window=refresh_window,
-    )
+    # Phase A: refresh engagement window (and push) to update engagement counts used for ranking
+    if refresh_days is not None:
+        fetcher.fetch(
+            handles=handles,
+            max_age_days=int(refresh_days),
+            cutoff_check_every=cutoff_check_every,
+            include_pins=include_pins,
+            sqlite_path=sqlite_path,
+            refresh_window=True,
+        )
+    # Phase B: ensure clustering context is available out to cluster_days without re-refreshing older rows
+    if cluster_days is not None and (refresh_days is None or int(cluster_days) > int(refresh_days)):
+        fetcher.fetch(
+            handles=handles,
+            max_age_days=int(cluster_days),
+            cutoff_check_every=cutoff_check_every,
+            include_pins=include_pins,
+            sqlite_path=sqlite_path,
+            refresh_window=False,
+        )
 
     db_path = sqlite_path or 'newsflows.db'
     conn = ensure_db(db_path)
+
+    # Migration: ensure createdAt_ns exists and is populated for robust time handling
+    try:
+        cur = conn.execute("PRAGMA table_info(posts)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'createdAt_ns' not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN createdAt_ns INTEGER")
+        # Populate any NULL createdAt_ns values
+        cur = conn.execute("SELECT uri, createdAt FROM posts WHERE createdAt_ns IS NULL OR createdAt_ns = ''")
+        rows = cur.fetchall()
+        if rows:
+            from datetime import datetime, timezone
+            def _to_ns(s: str) -> int | None:
+                if not s:
+                    return None
+                t = s
+                if t.endswith('Z'):
+                    t = t[:-1] + '+00:00'
+                try:
+                    dt = datetime.fromisoformat(t)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    return int(dt.timestamp() * 1_000_000_000)
+                except Exception:
+                    return None
+            for uri, created in rows:
+                ns = _to_ns(created)
+                if ns is not None:
+                    conn.execute("UPDATE posts SET createdAt_ns=? WHERE uri=?", (ns, uri))
+            conn.commit()
+    except Exception:
+        pass
 
     # Helper: load URIs from the most recent export for a handle
     def _load_last_uris_for_handle(handle: str) -> set[str]:
@@ -166,25 +245,24 @@ def run_fetch_rank_push(
             demote_uris = []
         demoted_count = len(demote_uris)
         # Compute simple cluster stats
-        # Compute cluster engagement on the pushed subset using the same definition
-        # as the ranker (sum per metric with nulls treated as 0, then sum horizontally).
+        # Build top cluster summary derived from the ranker's fields to ensure consistency
         agg = (
             pushed.group_by('cluster')
             .agg([
-                pl.len().alias('size'),
-                pl.col('like_count').fill_null(0).sum().alias('like_sum'),
-                pl.col('reply_count').fill_null(0).sum().alias('reply_sum'),
-                pl.col('quote_count').fill_null(0).sum().alias('quote_sum'),
-                pl.col('repost_count').fill_null(0).sum().alias('repost_sum'),
-                pl.col('cluster_engagement_rank').min().alias('cluster_engagement_rank'),
+                pl.len().alias('size_push'),
+                pl.col('cluster_engagement_count').max().alias('engagement'),
+                pl.col('cluster_engagement_rank').min().alias('rank'),
+                pl.col('cluster_size_initial').max().alias('size_initial'),
+                pl.col('cluster_size_engagement').max().alias('size_engagement'),
+                pl.col('cluster_size_push').max().alias('size_push_confirm'),
                 pl.col('news_title').drop_nulls().head(60).alias('titles'),
                 pl.col('text').drop_nulls().head(60).alias('texts'),
             ])
             .with_columns(
-                engagement=pl.sum_horizontal('like_sum','reply_sum','quote_sum','repost_sum')
+                size_push=pl.coalesce([pl.col('size_push_confirm'), pl.col('size_push')])
             )
-            .drop(['like_sum','reply_sum','quote_sum','repost_sum'])
-            .sort(['engagement','size'], descending=[True, True])
+            .drop(['size_push_confirm'])
+            .sort(['rank'], descending=[False])
         )
 
         # Build top cluster summary data for cleaner logging
@@ -201,9 +279,11 @@ def run_fetch_rank_push(
                 pass
             top_clusters.append({
                 'cluster': cid,
-                'size': int(row['size']) if row['size'] is not None else 0,
+                'size_initial': int(row.get('size_initial') or 0),
+                'size_engagement': int(row.get('size_engagement') or 0),
+                'size_push': int(row.get('size_push') or 0),
                 'engagement': int(row['engagement']) if row['engagement'] is not None else 0,
-                'rank': int(row['cluster_engagement_rank']) if row.get('cluster_engagement_rank') is not None else None,
+                'rank': int(row['rank']) if row.get('rank') is not None else None,
                 'keywords': kws,
             })
             try:
@@ -278,13 +358,24 @@ def run_fetch_rank_push(
             push_with_prio = pushed_df.with_columns(
                 prio=(pl.lit(1000) - pl.arange(0, pl.len()))
             )
+            # Add local-time string for createdAt (Europe/Amsterdam) for validation
+            tz = "Europe/Amsterdam"
+            if 'createdAt_dt' in push_with_prio.columns:
+                push_with_prio = push_with_prio.with_columns(
+                    pl.col('createdAt_dt').dt.convert_time_zone(tz).dt.strftime('%Y-%m-%d %H:%M:%S %z').alias('createdAt_local')
+                )
+            else:
+                # Fallback: parse createdAt and convert
+                push_with_prio = push_with_prio.with_columns(
+                    pl.col('createdAt').str.to_datetime(strict=False, time_zone='UTC').dt.convert_time_zone(tz).dt.strftime('%Y-%m-%d %H:%M:%S %z').alias('createdAt_local')
+                )
             # Select fields and convert to list of dicts in the final order
             cols = [
-                'prio','uri','cluster','createdAt','news_uri','text','news_title','news_description',
+                'prio','uri','cluster','createdAt','createdAt_local','news_uri','text','news_title','news_description',
                 'like_count','reply_count','quote_count','repost_count',
             ]
             # Some cluster stats may or may not be present; include when available
-            opt_cols = ['cluster_size','cluster_engagement_count','cluster_engagement_rank']
+            opt_cols = ['cluster_size_initial','cluster_size_engagement','cluster_size_push','cluster_engagement_count','cluster_engagement_rank']
             existing_opt = [c for c in opt_cols if c in push_with_prio.columns]
             rows = push_with_prio.select(
                 [pl.col('prio').alias('priority')] + [pl.col(c) for c in cols[1:]] + [pl.col(c) for c in existing_opt]
@@ -316,16 +407,24 @@ def run_fetch_rank_push(
                 'top_clusters': [
                     {
                         'cluster': tc['cluster'],
-                        'size': tc['size'],
-                        'engagement': tc['engagement'],
-                        'keywords': tc['keywords'],
+                        'rank': tc.get('rank'),
+                        'engagement': tc.get('engagement', 0),
+                        'size_initial': tc.get('size_initial', 0),
+                        'size_engagement': tc.get('size_engagement', 0),
+                        'size_push': tc.get('size_push', 0),
+                        'keywords': tc.get('keywords', []),
                     }
                     for tc in top_clusters
                 ],
                 'items': rows,
             }
-            # Human-readable timestamp for filename (UTC) e.g., 2025-09-15T12-49-43Z
-            ts_readable = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+            # Human-readable timestamp for filename based on the newest local item time
+            try:
+                ts_local = push_with_prio.select(pl.col('createdAt_local').max().alias('ts')).to_dicts()[0]['ts']
+            except Exception:
+                ts_local = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S +0000')
+            # Convert "YYYY-MM-DD HH:MM:SS +HHMM" → "YYYY-MM-DDTHH-MM-SS+HHMM" for filename safety
+            ts_readable = ts_local.replace(' ', 'T', 1).replace(':','-')
             safe_handle = h.replace('.', '_')
             out_path = os.path.join('push_exports', f"push_{safe_handle}_{ts_readable}.json")
             with open(out_path, 'w', encoding='utf-8') as f:
@@ -335,8 +434,8 @@ def run_fetch_rank_push(
             # Display an intelligible summary and a small priority preview
             print(f"\n=== Dry Run: handle={h} posts={pushed.height} method={method} threshold={similarity_threshold} windows=({windows_str})")
             for tc in top_clusters:
-                kws = ' '.join(tc['keywords']) if tc['keywords'] else ''
-                print(f"  cluster={tc['cluster']} size={tc['size']} engagement={tc['engagement']} keywords=\"{kws}\"")
+                kws = ' '.join(tc.get('keywords', [])) if tc.get('keywords') else ''
+                print(f"  cluster={tc['cluster']} rank={tc.get('rank')} size_push={tc.get('size_push',0)} engagement={tc.get('engagement',0)} keywords=\"{kws}\"")
             if per_cluster_recent_lines:
                 print("  Top cluster posts (5 each):")
                 for line in per_cluster_recent_lines:
@@ -382,9 +481,9 @@ def run_fetch_rank_push(
             lines.append(f"  - demoted last-run URIs: {counts['demoted']}")
             lines.append("Top Clusters:")
             for tc in top_clusters:
-                lines.append(f"  - cluster {tc['cluster']} (size={tc['size']}, engagement={tc['engagement']})")
-                if tc['keywords']:
-                    lines.append(f"    keywords: {' '.join(tc['keywords'])}")
+                lines.append(f"  - cluster {tc['cluster']} (rank={tc.get('rank')}, size_push={tc.get('size_push',0)}, engagement={tc.get('engagement',0)})")
+                if tc.get('keywords'):
+                    lines.append(f"    keywords: {' '.join(tc.get('keywords', []))}")
             if per_cluster_recent:
                 lines.append("Top Cluster Posts (5 each):")
                 for cid in top_cluster_ids:
@@ -433,9 +532,9 @@ def run_fetch_rank_push(
             lines.append(f"  - demoted last-run URIs: {counts['demoted']}")
             lines.append("Top Clusters:")
             for tc in top_clusters:
-                lines.append(f"  - cluster {tc['cluster']} (size={tc['size']}, engagement={tc['engagement']})")
-                if tc['keywords']:
-                    lines.append(f"    keywords: {' '.join(tc['keywords'])}")
+                lines.append(f"  - cluster {tc['cluster']} (rank={tc.get('rank')}, size_push={tc.get('size_push',0)}, engagement={tc.get('engagement',0)})")
+                if tc.get('keywords'):
+                    lines.append(f"    keywords: {' '.join(tc.get('keywords', []))}")
             if per_cluster_recent:
                 lines.append("Top Cluster Posts (5 each):")
                 for cid in top_cluster_ids:

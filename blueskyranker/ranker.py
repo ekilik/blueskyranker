@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+Topic ranking: cluster posts into topics and order them by cluster engagement.
+
+Key principles used throughout the module:
+- Time is handled in UTC; when available, `createdAt_ns` (epoch nanoseconds) is preferred
+  for filtering and sorting. Human readable local timestamps are only added to exports.
+- Three time windows drive behavior:
+  * clustering window → build topic graph (no engagement computed here)
+  * engagement window → compute cluster engagement and deterministic ranks
+  * push window → eligible posts for the final, interleaved priority list
+- Deterministic tie‑breaks: higher engagement first; ties broken by higher average recency,
+  then by the cluster id to ensure full reproducibility.
+"""
 import polars as pl
 from typing import Literal
 from itertools import zip_longest
@@ -7,6 +20,7 @@ import os
 import requests
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 
@@ -292,7 +306,9 @@ class TopicRanker(_BaseRanker):
         clusterassignment_df = pl.DataFrame(clusterassignment,orient='row', schema=["cid","cluster"])
         #clusterassignment_df = clusterassignment_df.join(clusterassignment_df.group_by('cluster').len(), on='cluster').rename({'len':'clustersize'})
         data = data.join(clusterassignment_df, on='cid')
-        data = self._add_cluster_stats(data)
+        # Do NOT compute engagement-based stats here; they depend on the engagement window.
+        # Stats (engagement count, rank, and sizes) are computed later in rank() via _add_cluster_stats
+        # with the correct stats_subset and initial sizes.
         return data
 
     def _add_cluster_stats(self, df_with_clusters, stats_subset: pl.DataFrame | None = None):
@@ -302,33 +318,66 @@ class TopicRanker(_BaseRanker):
         independent of the outer 'descending' flag.
         """
         src = stats_subset if stats_subset is not None else df_with_clusters
-        clusterstats = src.group_by('cluster').agg(pl.col('like_count').sum(),
-            pl.col('reply_count').sum(),
-            pl.col('quote_count').sum(),
-            pl.col('repost_count').sum(),
-            pl.len())
-        # TODO: MAYBE WEIGH THIS, SUCH THAT A LIKE COUNTS LESS THAN A REPLY?
-        clusterstats = clusterstats.with_columns(sum=pl.sum_horizontal("reply_count", "like_count",'repost_count','quote_count'))
-        # Lower engagement_rank means higher engagement; independent of outer descending
-        clusterstats = clusterstats.with_columns(
-            engagement_rank=clusterstats["sum"].rank(method='random', descending=True)
-        ).rename({'sum':'engagement_count', 'len':'size'}) 
-        clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({"cluster_cluster": "cluster"})
-        df_with_clusters = df_with_clusters.join(clusterstats, on="cluster")
+        # Aggregate per cluster on engagement window: sums per metric, size (engagement), and average createdAt (for tie-break)
+        clusterstats = (
+            src.group_by('cluster')
+            .agg([
+                pl.col('like_count').fill_null(0).sum().alias('like_count'),
+                pl.col('reply_count').fill_null(0).sum().alias('reply_count'),
+                pl.col('quote_count').fill_null(0).sum().alias('quote_count'),
+                pl.col('repost_count').fill_null(0).sum().alias('repost_count'),
+                pl.len().alias('size_engagement'),
+                pl.col('createdAt_dt').mean().alias('avg_createdAt_dt'),
+            ])
+            .with_columns(
+                sum=pl.sum_horizontal('reply_count','like_count','repost_count','quote_count')
+            )
+        )
+        # Also compute initial cluster sizes on the clustering context
+        initial_sizes = df_with_clusters.group_by('cluster').agg(pl.len().alias('size_initial'))
+        # Deterministic ranking: higher engagement first; ties broken by newer average createdAt
+        clusterstats = (
+            clusterstats
+            .sort(['sum','avg_createdAt_dt','cluster'], descending=[True, True, False])
+            .with_row_index(name='rank_idx')
+            .with_columns(engagement_rank=(pl.col('rank_idx') + 1))
+            .drop('rank_idx')
+            .rename({'sum':'engagement_count'})
+            .join(initial_sizes, on='cluster', how='left')
+        )
+        # Prefix for clarity and join back
+        clusterstats = clusterstats.rename(lambda x: f"cluster_{x}").rename({
+            "cluster_cluster": "cluster",
+            "cluster_size_engagement": "cluster_size_engagement",
+            "cluster_size_initial": "cluster_size_initial",
+        })
+        df_with_clusters = df_with_clusters.join(clusterstats, on='cluster')
         return df_with_clusters
         
         
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
-        """This ranker clusters the input by topic, and then creates a feedback loop by
-        upranking the most popular topic"""
+        """Cluster → compute engagement/ranks → interleave by rank within push window.
+
+        Steps:
+        1) Build clusters on the clustering window (context only; no engagement yet).
+        2) Compute engagement metrics and deterministic cluster ranks on the engagement window.
+        3) Restrict to the push window FIRST; sort each cluster by recency.
+        4) Interleave round‑robin across clusters ordered by cluster_engagement_rank.
+        Returns the same structure as input (ids/dicts/dataframe) preserving the final order.
+        """
         from datetime import datetime, timedelta, timezone
         df = self._transform_input(data)
 
-        # Parse createdAt to datetime for windowing (explicit UTC tz to satisfy Polars>=1.33)
+        # Parse createdAt robustly: prefer epoch ns if present; otherwise parse strict UTC
         if 'createdAt_dt' not in df.columns:
-            df = df.with_columns(
-                pl.col('createdAt').str.to_datetime(strict=False, time_zone='UTC').alias('createdAt_dt')
-            )
+            if 'createdAt_ns' in df.columns:
+                df = df.with_columns(
+                    pl.from_epoch(pl.col('createdAt_ns'), unit='ns', time_zone='UTC').alias('createdAt_dt')
+                )
+            else:
+                df = df.with_columns(
+                    pl.col('createdAt').str.to_datetime(strict=False, time_zone='UTC').alias('createdAt_dt')
+                )
 
         now = datetime.now(timezone.utc)
         # Determine effective cluster window so every later subset is covered
@@ -440,6 +489,12 @@ class TopicRanker(_BaseRanker):
         # Interleave round-robin across clusters in rank order
         interleaved = [item for bucket in zip_longest(*per_cluster_rows) for item in bucket if item is not None]
         final_ranking = pl.DataFrame(interleaved) if interleaved else eligible.head(0)
+        # Add push-window cluster sizes for transparency
+        try:
+            push_sizes = eligible.group_by('cluster').agg(pl.len().alias('cluster_size_push'))
+            final_ranking = final_ranking.join(push_sizes, on='cluster', how='left')
+        except Exception:
+            pass
 
         self.ranking = final_ranking
         try:

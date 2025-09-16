@@ -336,6 +336,21 @@ The pipeline’s fetch step refreshes engagement metrics for all posts within th
 - Default: `--refresh-window` is enabled, which re-fetches the entire effective window and upserts to SQLite (updating likes/replies/quotes/reposts).
 - To opt out (incremental only): pass `--no-refresh-window` (will fetch only posts newer than the latest in DB and not refresh older rows inside the window).
 
+### Time handling
+
+- Canonical UTC timestamps are stored in `posts.createdAt`; `posts.createdAt_ns` (epoch nanoseconds) is used for window filtering and sorting.
+- JSON export adds `createdAt_local` (Europe/Amsterdam) for validation; logic never relies on local time.
+
+### Ranking and priorities
+
+- Cluster engagement = sum(likes + replies + quotes + reposts) over the engagement window.
+- Deterministic cluster rank: higher engagement first; ties broken by average recency and then cluster id.
+- Priorities start at 1000 and decrease by 1 (clamped at 1). Demoted URIs are posted with priority 0.
+
+### JSON export content
+
+- `top_clusters` mirrors the ranker’s truth and includes `cluster`, `rank`, `engagement`, and three sizes: `size_initial` (clustering), `size_engagement` (engagement), `size_push` (push).
+
 ## Data Schema (SQLite)
 Table `posts` (upsert by `uri`):
 

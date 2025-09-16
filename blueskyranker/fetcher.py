@@ -1,43 +1,15 @@
 #!/usr/bin/env python3
 """
-Bluesky Author Feed Scraper (via public AppView, using atproto)
+Bluesky Author Feed Scraper (via public AppView using `atproto`).
 
-Fetches PUBLIC posts for one or more Bluesky handles with engagement metrics and
-embedded news link metadata. Shows progress bars, supports a max-age cutoff,
-appends to per-handle CSVs (de-duped by URI), re-fetches the last-saved day for
-safety, and updates a combined CSV. Designed for repeat, incremental runs.
+Responsibilities:
+- Fetch PUBLIC posts for one or more Bluesky handles with engagement metrics and
+  embedded news link metadata.
+- Normalise timestamps: store canonical UTC TEXT in `createdAt` and an epoch nanosecond
+  integer in `createdAt_ns` for robust sorting and window filtering.
+- Upsert into SQLite by URI (refresh engagement on repeats) and optionally export CSVs.
 
-Usage:
-    python fetch_bsky_author_feeds_progress.py \
-        --handles <handle1> <handle2> ... \
-        [--max-age-days N] [--cutoff-check-every K] \
-        [--include-pins | --no-include-pins] [--xrpc-base URL]
-
-Parameters:
-    --handles               Space-separated Bluesky handles to fetch.
-                            Default: news-flows-nl.bsky.social news-flows-ir.bsky.social
-                                    news-flows-cz.bsky.social news-flows-fr.bsky.social
-    --xrpc-base             XRPC base URL.
-                            Default: https://public.api.bsky.app/xrpc
-    --max-age-days          Only keep posts with createdAt within last N days;
-                            also used with incremental logic (see below).
-                            Default: 7
-    --cutoff-check-every    Pages between early-stop checks against cutoff.
-                            Default: 1
-    --include-pins          Include pinned posts.
-                            Default is to exclude.
-    --no-include-pins       Explicitly exclude pinned posts.
-                            Default is to include.
-
-Outputs:
-    - Per-handle CSVs: {handle_with_dots_replaced}_author_feed.csv (append-only, de-duped by uri).
-    - Combined CSV:    all_handles_author_feed.csv (only rows newly added THIS run).
-
-Example usage for the past 7 days:
-    python fetch_bsky_author_feeds_progress.py
-
-Requirements:
-    pip install atproto tqdm
+CLI examples live in the README; this module is used programmatically by the pipeline.
 """
 
 import csv
@@ -48,6 +20,7 @@ import sqlite3
 import glob
 from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 
 from atproto import Client, models
@@ -82,6 +55,7 @@ def ensure_db(path: str) -> sqlite3.Connection:
             author_did TEXT,
             indexedAt TEXT,
             createdAt TEXT,
+            createdAt_ns INTEGER,
             text TEXT,
             reply_root_uri TEXT,
             reply_parent_uri TEXT,
@@ -98,6 +72,7 @@ def ensure_db(path: str) -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_handle)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(createdAt)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_ns ON posts(createdAt_ns)")
     return conn
 
 def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
@@ -112,7 +87,10 @@ def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
                 r[k] = None
         return r
     rows = [_norm(dict(r)) for r in rows]
-    cols = CSV_HEADERS
+    # Accept optional createdAt_ns if present in rows
+    cols = list(CSV_HEADERS)
+    if rows and 'createdAt_ns' in rows[0]:
+        cols = cols.copy() + ['createdAt_ns']
     placeholders = ",".join([":"+c for c in cols])
     update_clause = ",".join([f"{c}=excluded.{c}" for c in cols if c != "uri"])  # leave PK as-is
     sql = f"""
@@ -275,6 +253,32 @@ def extract_news_embed(item_post: Any, record: Any) -> Tuple[Optional[str], Opti
 
     return (None, None, None)
 
+def _parse_and_normalise_created_at(created_at: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
+    """Parse a source timestamp into canonical UTC string and epoch nanoseconds.
+
+    - Accepts either trailing 'Z' or explicit offsets like '+00:00'.
+    - Returns (iso_utc, epoch_ns). If parsing fails, returns (original_string, None).
+    """
+    if not created_at:
+        return None, None
+    s = str(created_at)
+    # Normalise: replace trailing 'Z' with '+00:00' for fromisoformat
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return created_at, None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    # Canonical string with microseconds and Z
+    iso = dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    ns = int(dt.timestamp() * 1_000_000_000)
+    return iso, ns
+
+
 def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost) -> Dict[str, Any]:
     post = item.post
     record = getattr(post, "record", None)
@@ -290,13 +294,17 @@ def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost) -> Dict[str, Any]:
 
     news_title, news_description, news_uri = extract_news_embed(post, record)
 
+    # Normalise createdAt and compute epoch ns
+    created_iso, created_ns = _parse_and_normalise_created_at(getattr(record, "created_at", None) if record else None)
+
     return {
         "uri": getattr(post, "uri", None),
         "cid": getattr(post, "cid", None),
         "author_handle": getattr(author, "handle", None) if author else None,
         "author_did": getattr(author, "did", None) if author else None,
         "indexedAt": getattr(post, "indexed_at", None),
-        "createdAt": getattr(record, "created_at", None) if record else None,
+        "createdAt": created_iso,
+        "createdAt_ns": created_ns,
         "text": getattr(record, "text", None) if record else None,
         "reply_root_uri": reply_root_uri,
         "reply_parent_uri": reply_parent_uri,
