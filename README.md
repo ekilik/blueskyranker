@@ -197,6 +197,25 @@ python -m blueskyranker.pipeline \
   --no-test
 ```
 
+### Ordering logic
+
+The TopicRanker orders posts using three time windows:
+
+- Clustering window: builds topical clusters from posts in this window (e.g., 7 days).
+- Engagement window: computes cluster engagement totals (likes + replies + quotes + reposts) and derives `cluster_engagement_rank` (1 = most engaged).
+- Push window: restricts the final output to only posts in this window (e.g., 24–48h).
+
+Ordering steps:
+- Filter to the push window first; only eligible posts participate in ordering.
+- Order clusters by `cluster_engagement_rank` (most engaged first).
+- Within each cluster, sort posts by recency (newest first).
+- Interleave round‑robin across clusters in that rank order (1, 2, 3, … then repeat) to create the final sequence.
+
+Implications:
+- The first post is the most recent item (within the push window) from the most‑engaged cluster (measured over the engagement window).
+- If a high‑ranked cluster has no posts in the push window, it is skipped.
+- The “Top clusters” block in the export is computed over the pushed subset and may not exactly match the engagement window used for ranking (by design), but will generally align closely.
+
 Programmatic one‑liner:
 
 ```python

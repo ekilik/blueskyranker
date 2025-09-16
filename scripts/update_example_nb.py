@@ -28,12 +28,27 @@ md = (
 
 cell = {"cell_type": "markdown", "metadata": {}, "source": md}
 
+# Additional cell documenting ordering logic
+md2 = (
+    "### Ordering logic (time windows)\n\n"
+    "- Clustering window: clusters are built from posts in this window (e.g., 7 days).\n"
+    "- Engagement window: cluster engagement is computed here to derive `cluster_engagement_rank` (1 = most engaged).\n"
+    "- Push window: only posts in this window are eligible for the final feed.\n\n"
+    "Order of posts:\n\n"
+    "1) Filter to the push window.\n\n"
+    "2) Order clusters by engagement rank (most engaged first).\n\n"
+    "3) Within each cluster, sort by recency (newest first).\n\n"
+    "4) Interleave round‑robin across clusters in rank order (1, 2, 3, … then repeat).\n\n"
+    "Result: the first post is the most‑recent item from the most‑engaged cluster that has posts in the push window.\n"
+)
+cell2 = {"cell_type": "markdown", "metadata": {}, "source": md2}
+
 def main():
     data = json.loads(NB_PATH.read_text(encoding='utf-8'))
     data.setdefault('cells', []).append(cell)
+    data['cells'].append(cell2)
     NB_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f"Appended markdown cell to {NB_PATH}")
 
 if __name__ == '__main__':
     main()
-

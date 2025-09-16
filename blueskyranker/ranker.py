@@ -398,32 +398,48 @@ class TopicRanker(_BaseRanker):
             self.meta['engagement_total'] = 0
         df_with_clusters = self._add_cluster_stats(df_with_clusters, stats_subset=stats_subset)
 
-        df_with_clusters = df_with_clusters.sort(
-            by='cluster_engagement_rank', descending=not self.descending
-        )
-        
-        # TODO: Implement saturation here, such that we do not have just the same things from the same cluster
-        # TODO: (iteratively construct feed accounting for a topic saturation penalty (if post is already covered; see example below).)
-
-        #a = ['a1','a2']
-        #b = ['b1','b2','b3']
-        #c = ['c1']
-        # [item for cluster in zip_longest(a,b,c) for item in cluster if item is not None]
-        # gives: ['a1', 'b1', 'c1', 'a2', 'b2', 'b3']
-
-        # AND NOW THIS FOR OUR DATA
-        # We take the first article from the most-engaged cluster, then the first article from the second-most-engaged-cluster, then from the third, etc.
-        # If we exausted, we start from the beginning
-        # If a cluster is exausted, we just skip it
-        # (see toy example abouve)
-        list_of_clusters_gen = (cluster.rows(named=True)  for _, cluster in df_with_clusters.group_by('cluster_engagement_rank', maintain_order=True))
-        fancyranking = [item for cluster in zip_longest(*list_of_clusters_gen) for item in cluster if item is not None]
-        final_ranking = pl.DataFrame(fancyranking)
-
-        # Optionally restrict the output to a push window
+        # Determine which rows are eligible for the push (apply push window BEFORE interleaving)
         if self.push_window_days is not None:
             push_cutoff = now - timedelta(days=int(self.push_window_days))
-            final_ranking = final_ranking.filter(pl.col('createdAt_dt') >= push_cutoff)
+            eligible = df_with_clusters.filter(pl.col('createdAt_dt') >= push_cutoff)
+        else:
+            eligible = df_with_clusters
+
+        # Build cluster order by engagement rank (1 first when descending=True)
+        # Skip clusters that have no eligible rows
+        try:
+            cluster_order = (
+                eligible
+                .select(['cluster', 'cluster_engagement_rank'])
+                .unique(maintain_order=True)
+                .group_by('cluster')
+                .agg(pl.col('cluster_engagement_rank').first())
+                .sort('cluster_engagement_rank', descending=not self.descending)
+                .select('cluster')
+                .to_series()
+                .to_list()
+            )
+        except Exception:
+            cluster_order = []
+
+        # For each cluster in order, collect its eligible rows sorted by recency (freshest first)
+        per_cluster_rows = []
+        for cid in cluster_order:
+            try:
+                rows = (
+                    eligible
+                    .filter(pl.col('cluster') == cid)
+                    .sort('createdAt_dt', descending=True)
+                    .rows(named=True)
+                )
+            except Exception:
+                rows = []
+            if rows:
+                per_cluster_rows.append(rows)
+
+        # Interleave round-robin across clusters in rank order
+        interleaved = [item for bucket in zip_longest(*per_cluster_rows) for item in bucket if item is not None]
+        final_ranking = pl.DataFrame(interleaved) if interleaved else eligible.head(0)
 
         self.ranking = final_ranking
         try:
