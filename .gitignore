@@ -78,6 +78,18 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Runtime artifacts (exports, logs, DB, responses)
+push_exports/
+push.log
+newsflows.db
+*.db
+prioritize_response_*.json
+prioritize_response_*.txt
+
+# Environment files (may contain secrets)
+.env
+blueskyranker/.env
+
 # IPython
 profile_default/
 ipython_config.py

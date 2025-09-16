@@ -5,6 +5,8 @@ from itertools import zip_longest
 from dotenv import load_dotenv
 import os
 import requests
+import json
+from datetime import datetime, timezone
 
 
 
@@ -18,6 +20,7 @@ import numpy as np
 # Delay heavy imports (igraph, leidenalg) until needed in _cluster
 
 load_dotenv(".env")
+load_dotenv("blueskyranker/.env")
 
 
 class _BaseRanker():
@@ -25,8 +28,8 @@ class _BaseRanker():
 
     - returnformat: one of 'id' | 'dicts' | 'dataframe'
     - descending: when True, rankers should place the most important items FIRST.
-      The post() method preserves row order and assigns priority 0 to the first row
-      (lower numbers = higher priority on the feed API).
+      The post() method preserves row order and assigns the HIGHEST numeric
+      priority to the first row (higher numbers = higher priority on the feed API).
     """
     def __init__(self, returnformat: Literal["id","dicts","dataframe"], metric=None, descending = False):
         self.required_keys = None
@@ -54,7 +57,7 @@ class _BaseRanker():
 
     def _transform_output(self, data):
         # Do not change order here. Rankers must output final order
-        # (top row = highest priority = priority index 0).
+        # (top row = highest priority; mapping to numeric priority happens in post()).
         if self.returnformat == 'id':
             return data['uri'].to_list()
         elif self.returnformat == "dicts":
@@ -72,7 +75,7 @@ class _BaseRanker():
         raise NotImplementedError
         
 
-    def post(self, test = True,):
+    def post(self, test: bool = True, handle: str | None = None, extra_uris_zero_prio: list[str] | None = None,):
         """Send the ranking to the server that generates new feeds
         Essentially a port of https://github.com/JBGruber/newsflows-bsky-feed-generator/blob/main/scripts/prioritise.r
         
@@ -85,16 +88,94 @@ class _BaseRanker():
 
         assert self.ranking is not None, "You need to call .rank() first to rank the posts before you can post them"
         
-        post_list = self.ranking [['uri']].with_row_index().rename({'index':'priority'}).rows(named=True)
+        # Build priority list so that HIGHER numbers mean HIGHER priority.
+        # Preserve current row order, then assign priorities starting at 1000:
+        # top row → 1000, second → 999, ...
+        df = self.ranking.select([pl.col('uri')]).with_row_index(name='idx')
+        # Start at 1000 and clamp at minimum 1 to avoid negatives when many items
+        df = df.with_columns((pl.lit(1000) - pl.col('idx')).alias('priority'))
+        df = df.with_columns(
+            pl.when(pl.col('priority') < 1).then(1).otherwise(pl.col('priority')).alias('priority')
+        ).select(['priority','uri'])
+        post_list = df.rows(named=True)
+        # Optionally add extra URIs (typically from last run) with priority 0 to demote them
+        if extra_uris_zero_prio:
+            current_uris = {row['uri'] for row in post_list}
+            extras = [
+                {'priority': 0, 'uri': u}
+                for u in extra_uris_zero_prio if u and u not in current_uris
+            ]
+            if extras:
+                logger.debug(f"Appending {len(extras)} extra URIs with priority 0 (demote)")
+                post_list.extend(extras)
         logger.debug(f"Sending this post_list:\n{post_list}")
-        resp = requests.post(f"{server}/api/prioritize", headers=headers, params=params, json=post_list)
-        if resp.status_code==200:
+        # Perform request and capture/print/save any server response
+        try:
+            resp = requests.post(f"{server}/api/prioritize", headers=headers, params=params, json=post_list)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"POST to {server}/api/prioritize failed: {e}")
+            print(f"[ERROR] POST failed: {e}")
+            return False
+
+        # Prepare readable filename components
+        safe_handle = (handle or 'unknown').replace('.', '_')
+        ts_readable = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+
+        # Try to parse as JSON; fall back to text
+        resp_json = None
+        resp_text = None
+        try:
+            resp_json = resp.json()
+            content_for_length = json.dumps(resp_json, ensure_ascii=False)
+        except Exception:
+            resp_text = resp.text or ''
+            content_for_length = resp_text
+
+        # Decide whether to print inline or save to file (long output)
+        is_long = len(content_for_length) > 2000
+        saved_path = None
+        if is_long:
+            try:
+                os.makedirs('push_exports', exist_ok=True)
+                ext = 'json' if resp_json is not None else 'txt'
+                saved_path = os.path.join('push_exports', f"prioritize_response_{safe_handle}_{ts_readable}.{ext}")
+                with open(saved_path, 'w', encoding='utf-8') as f:
+                    if resp_json is not None:
+                        json.dump(resp_json, f, ensure_ascii=False, indent=2)
+                    else:
+                        f.write(resp_text)
+                print(f"Server response saved to: {saved_path}")
+                logger.info(f"Server response saved to: {saved_path}")
+            except Exception as e:
+                logger.error(f"Failed to save server response: {e}")
+                print(f"[WARN] Failed to save server response: {e}")
+        else:
+            # Short response: print to console and debug log
+            if resp_json is not None:
+                pretty = json.dumps(resp_json, ensure_ascii=False, indent=2)
+                print(f"Server response (status {resp.status_code}):\n{pretty}")
+                logger.debug(f"Server response JSON: {pretty}")
+            else:
+                print(f"Server response (status {resp.status_code}): {resp_text}")
+                logger.debug(f"Server response text: {resp_text}")
+
+        # Return success boolean and log details
+        if resp.status_code == 200:
             logger.debug(resp)
-            logger.debug(resp.text)
+            if saved_path:
+                logger.info(f"Response stored at {saved_path}")
             return True
         else:
             logger.error(resp)
-            logger.error(resp.text)
+            # For non-200 responses, ensure details are available
+            if not is_long and (resp_text or resp_json is not None):
+                # Already printed above; also log at error level
+                if resp_json is not None:
+                    logger.error(json.dumps(resp_json, ensure_ascii=False))
+                else:
+                    logger.error(resp_text)
+            elif saved_path:
+                logger.error(f"Non-200 response details saved at {saved_path}")
             return False
 
         
@@ -119,7 +200,7 @@ class PopularityRanker(_BaseRanker):
     def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
         """Sorts by the selected engagement metric.
 
-        With descending=True, highest metric appears first (priority 0).
+        With descending=True, highest metric appears first (will be assigned the highest numeric priority).
         """
         df = self._transform_input(data)
         df = df.sort(by=self.metric, descending=self.descending)  # returns new DataFrame
@@ -161,6 +242,8 @@ class TopicRanker(_BaseRanker):
         self.engagement_window_days = engagement_window_days
         self.push_window_days = push_window_days
         self.ranking = None # will only be populated after .rank() is called (think of .fit() in scikit-learn)
+        # Meta counters to aid logging/export at pipeline level
+        self.meta: dict[str, int] = {}
 
     
     def _cluster(self, data: pl.DataFrame, similarity: Literal['tfidf-cosine', 'count-cosine', 'sbert-cosine'] = 'tfidf-cosine'):
@@ -241,9 +324,11 @@ class TopicRanker(_BaseRanker):
         from datetime import datetime, timedelta, timezone
         df = self._transform_input(data)
 
-        # Parse createdAt to datetime for windowing
+        # Parse createdAt to datetime for windowing (explicit UTC tz to satisfy Polars>=1.33)
         if 'createdAt_dt' not in df.columns:
-            df = df.with_columns(createdAt_dt=pl.col('createdAt').str.strptime(pl.Datetime, strict=False))
+            df = df.with_columns(
+                pl.col('createdAt').str.to_datetime(strict=False, time_zone='UTC').alias('createdAt_dt')
+            )
 
         now = datetime.now(timezone.utc)
         # Determine effective cluster window so every later subset is covered
@@ -254,6 +339,11 @@ class TopicRanker(_BaseRanker):
             df_cluster_base = df.filter(pl.col('createdAt_dt') >= cluster_cutoff)
         else:
             df_cluster_base = df
+        # Count posts that went into clustering context
+        try:
+            self.meta['cluster_posts'] = int(df_cluster_base.height)
+        except Exception:
+            self.meta['cluster_posts'] = 0
 
         if self.method == 'networkclustering-tfidf':
             df_with_clusters = self._cluster(df_cluster_base, similarity='tfidf-cosine')
@@ -264,6 +354,12 @@ class TopicRanker(_BaseRanker):
                 logger.warning(f"Do you really want to do this? You have {len(df_cluster_base)} texts, calculating sentence embeddings will be REALLY slow")
                 logger.warning(f"Consider using another method, or submitting less document")
             df_with_clusters = self._cluster(df_cluster_base, similarity='sbert-cosine')
+        # Count clusters created over the clustered set (before any push-window filter)
+        try:
+            ncl = df_with_clusters.select(pl.col('cluster').n_unique().alias('n')).to_dicts()[0]['n']
+            self.meta['clusters_created'] = int(ncl) if ncl is not None else 0
+        except Exception:
+            self.meta['clusters_created'] = 0
               
         # OPTION 1
         # This here would be a very simplistic ranking, we simply rank by cluster size
@@ -283,6 +379,23 @@ class TopicRanker(_BaseRanker):
             stats_subset = df_with_clusters.filter(pl.col('createdAt_dt') >= engagement_cutoff)
         else:
             stats_subset = None
+        try:
+            self.meta['engagement_posts'] = int(stats_subset.height) if stats_subset is not None else int(df_with_clusters.height)
+        except Exception:
+            self.meta['engagement_posts'] = 0
+        # Sum total engagement over the engagement window (likes+replies+quotes+reposts)
+        try:
+            src = stats_subset if stats_subset is not None else df_with_clusters
+            tot = (
+                src.select(
+                    (
+                        pl.col('like_count') + pl.col('reply_count') + pl.col('quote_count') + pl.col('repost_count')
+                    ).sum().alias('total')
+                ).to_dicts()[0]['total']
+            )
+            self.meta['engagement_total'] = int(tot) if tot is not None else 0
+        except Exception:
+            self.meta['engagement_total'] = 0
         df_with_clusters = self._add_cluster_stats(df_with_clusters, stats_subset=stats_subset)
 
         df_with_clusters = df_with_clusters.sort(
@@ -313,6 +426,10 @@ class TopicRanker(_BaseRanker):
             final_ranking = final_ranking.filter(pl.col('createdAt_dt') >= push_cutoff)
 
         self.ranking = final_ranking
+        try:
+            self.meta['push_posts'] = int(final_ranking.height)
+        except Exception:
+            self.meta['push_posts'] = 0
         return self._transform_output(final_ranking)
 
 

@@ -93,7 +93,7 @@ Set `FEEDGEN_HOSTNAME` and `PRIORITIZE_API_KEY` in `.env`. We use `python-dotenv
 
 ## Usage and Examples
 
-Priority semantics: the feed API treats LOWER numbers as higher priority (priority 0 is highest). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
+Priority semantics: the feed API treats HIGHER numbers as higher priority. The pipeline assigns priorities starting at 1000 for the first item, then 999, 998, … in order. Rankers output the most important item first; use `descending=True` to put strongest items at the top.
 
 Basic rankers (programmatic):
 ```python
@@ -185,12 +185,14 @@ A CLI runs the whole flow per handle and logs pushed clusters:
 
 ```bash
 python -m blueskyranker.pipeline \
-  --handles news-flows-nl.bsky.social news-flows-fr.bsky.social \
-  --method networkclustering-tfidf \
-  --similarity-threshold 0.2 \
+  --handles news-flows-nl.bsky.social news-flows-fr.bsky.social news-flows-ir.bsky.social news-flows-cz.bsky.social \
+  --method networkclustering-sbert \
+  --similarity-threshold 0.5 \
   --cluster-window-days 7 \
-  --engagement-window-days 3 \
+  --engagement-window-days 1 \
   --push-window-days 1 \
+  --demote-last \
+  --demote-window-hours 48 \
   --log-path push.log \
   --no-test
 ```
@@ -214,6 +216,8 @@ Each push appends a concise summary to the log, e.g.:
   cluster=12 size=10 engagement=538 keywords="europe policy migration"
   cluster=4  size=8  engagement=410 keywords="covid vaccine health"
   cluster=9  size=6  engagement=295 keywords="energy gas price"
+  - demoted last-run URIs: 7
+  - priorities: first=1000, decreasing by 1
 ```
 
 ### Dry run (no API call)
@@ -240,6 +244,20 @@ Sample output (abbreviated):
       1  c=4     2025-09-08T...  at://...  | Another headline
       ...
 ```
+The JSON export also includes `counts.demoted`.
+
+### Demote previously pushed items (default on)
+
+Background: previously pushed high-priority posts could linger at the top until overwritten. To counter this, the pipeline can include the last run’s URIs that are missing from the current push and explicitly set their priority to 0.
+
+- Enable/disable via CLI: `--demote-last` (default) / `--no-demote-last`.
+- Window: by default, considers the last 48 hours. Configure via `--demote-window-hours 48`.
+- Logging: `push.log` shows `demoted last-run URIs: <count>`.
+- Export: the per-run JSON in `push_exports/` includes `counts.demoted`.
+
+Notes:
+- Demotion is per handle and only applies to URIs present in the most recent export for that handle.
+- Demoted URIs are appended to the POST payload as `{ "priority": 0, "uri": "..." }` and are ignored if they already appear in the current push set.
 
 ## Cluster Report
 
@@ -268,7 +286,7 @@ generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
   - TrivialRanker: keeps input order.
   - PopularityRanker: sorts by a chosen engagement metric.
   - TopicRanker: builds a similarity graph (TF‑IDF/Count/SBERT), thresholds it, then applies Leiden clustering; clusters are ordered by aggregate engagement and interleaved for diversity.
-- Priority semantics: the feed API treats LOWER numbers as higher priority (0 is highest). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
+- Priority semantics: the feed API treats HIGHER numbers as higher priority (the first item is assigned the highest numeric priority). Rankers therefore output the most important item first; use `descending=True` to put strongest items at the top.
 
 ## Configuration (.env)
 For posting to the feed generator:
@@ -279,6 +297,17 @@ PRIORITIZE_API_KEY=...secret...
 ```
 
 Use `test=True` for a test request that doesn’t persist, or `--dry-run` to avoid calling the API entirely.
+
+### Server response handling
+When pushing priorities, the server’s response is printed if short. If it’s long (> ~2000 chars), it is saved to `push_exports/prioritize_response_{handle}_{YYYY-MM-DDTHH-mm-ssZ}.{json|txt}` and the path is printed and logged.
+
+### Export filenames
+Push exports are written to `push_exports/` with a human-readable UTC timestamp:
+
+```
+push_{handle}_{YYYY-MM-DDTHH-mm-ssZ}.json
+```
+For example: `push_news-flows-nl_bsky_social_2025-09-15T14-50-24Z.json`.
 
 ## Data Schema (SQLite)
 Table `posts` (upsert by `uri`):
