@@ -17,10 +17,8 @@ import os
 import argparse
 import time
 import sqlite3
-import glob
 from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from collections import defaultdict
 
 from atproto import Client, models
@@ -70,6 +68,12 @@ def ensure_db(path: str) -> sqlite3.Connection:
         )
         """
     )
+    # Pragmas for better concurrent reads and reasonable durability
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        logger.debug("PRAGMA setup failed; continuing with defaults")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_handle)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(createdAt)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_ns ON posts(createdAt_ns)")
@@ -102,6 +106,20 @@ def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 def latest_created_at_in_db(conn: sqlite3.Connection, handle: str) -> Optional[datetime]:
+    """Return latest createdAt based on createdAt_ns when available, else fallback to createdAt.
+
+    Uses UTC-aware datetimes for safe comparison downstream.
+    """
+    # Prefer high-precision epoch nanoseconds
+    cur = conn.execute("SELECT MAX(createdAt_ns) FROM posts WHERE author_handle=?", (handle,))
+    row = cur.fetchone()
+    if row and row[0]:
+        try:
+            ns = int(row[0])
+            return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc)
+        except Exception:
+            pass
+    # Fallback to canonical ISO UTC string
     cur = conn.execute("SELECT MAX(createdAt) FROM posts WHERE author_handle=?", (handle,))
     row = cur.fetchone()
     if not row:
@@ -182,7 +200,9 @@ def load_posts_df(conn: sqlite3.Connection, handle: Optional[str] = None, limit:
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     order_sql = f" ORDER BY {order_by} {'DESC' if descending else 'ASC'}"
     limit_sql = f" LIMIT {int(limit)}" if limit else ""
-    sql = f"SELECT {', '.join(CSV_HEADERS)} FROM posts{where_sql}{order_sql}{limit_sql}"
+    # Include createdAt_ns (not in CSV headers) so ranker/pipeline can prefer it for robust time ops
+    select_cols = CSV_HEADERS + ["createdAt_ns"]
+    sql = f"SELECT {', '.join(select_cols)} FROM posts{where_sql}{order_sql}{limit_sql}"
     cur = conn.execute(sql, args)
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -195,9 +215,14 @@ def iso_to_dt(s: Optional[str]) -> Optional[datetime]:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except Exception:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 def dt_to_iso(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
@@ -360,11 +385,31 @@ def fetch_author_feed_all(
         dt = iso_to_dt(created_at)
         return (dt is not None) and (dt >= cutoff_dt)
 
+    # Retry configuration (exponential backoff with jitter)
+    max_retries = 3
+    base_delay = 0.5
+
     while True:
         params = models.AppBskyFeedGetAuthorFeed.Params(
             actor=actor, limit=PAGE_LIMIT, cursor=cursor, include_pins=include_pins
         )
-        resp = client.app.bsky.feed.get_author_feed(params)
+        resp = None
+        for attempt in range(max_retries):
+            try:
+                resp = client.app.bsky.feed.get_author_feed(params)
+                break
+            except Exception as e:
+                delay = base_delay * (2 ** attempt)
+                # small jitter to avoid thundering herd
+                jitter = 0.05 * delay
+                logger.warning(
+                    f"get_author_feed failed for {actor} (cursor={cursor}) attempt {attempt+1}/{max_retries}: {e}"
+                )
+                time.sleep(delay + jitter)
+        if resp is None:
+            # Exhausted retries for this handle/cursor
+            logger.error(f"Aborting fetch for {actor} after {max_retries} failed attempts")
+            break
         feed = resp.feed or []
 
         # If we got nothing, stop
@@ -470,7 +515,7 @@ def fetch_author_feed_all(
     }
     return rows, stats
 
-def final_report(per_handle_stats: List[Dict[str, Any]]) -> None:
+def final_report(per_handle_stats: List[Dict[str, Any]]) -> str:
     # Aggregate totals
     lines = []
     grand = defaultdict(float)
@@ -545,18 +590,20 @@ class Fetcher():
     def __init__(self, xrpc_base=APPVIEW_XRPC):
         self.client = Client(xrpc_base)
 
-    def fetch(self, handles=[
-            "news-flows-nl.bsky.social",
-            "news-flows-ir.bsky.social",
-            "news-flows-cz.bsky.social",
-            "news-flows-fr.bsky.social",
-        ],
+    def fetch(self, handles: Optional[List[str]] = None,
         max_age_days=7,
         cutoff_check_every=1,
         include_pins=False,
         sqlite_path: Optional[str] = None,
         refresh_window: bool = False,
         ):
+        if handles is None:
+            handles = [
+                "news-flows-nl.bsky.social",
+                "news-flows-ir.bsky.social",
+                "news-flows-cz.bsky.social",
+                "news-flows-fr.bsky.social",
+            ]
         """Fetch public Bluesky posts (SQLite only).
 
         Parameters:

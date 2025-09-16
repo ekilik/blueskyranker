@@ -193,7 +193,6 @@ python -m blueskyranker.pipeline \
   --push-window-days 1 \
   --demote-last \
   --demote-window-hours 48 \
-  --refresh-window \
   --log-path push.log \
   --no-test
 ```
@@ -224,19 +223,19 @@ from blueskyranker.pipeline import run_fetch_rank_push
 
 run_fetch_rank_push(
     handles=['news-flows-nl.bsky.social'],
-    method='networkclustering-tfidf', similarity_threshold=0.2,
-    cluster_window_days=7, engagement_window_days=3, push_window_days=1,
+    method='networkclustering-sbert', similarity_threshold=0.2,
+    cluster_window_days=7, engagement_window_days=1, push_window_days=1,
     include_pins=False, test=False, log_path='push.log')
 ```
 
 Each push appends a concise summary to the log, e.g.:
 
 ```text
-2025-09-08T15:45:02+0000 INFO     [OK] handle=news-flows-nl.bsky.social posts=42 method=networkclustering-tfidf threshold=0.2 windows=(cluster=7d, engagement=3d, push=1d)
+2025-09-08T15:45:02+0000 INFO     [OK] handle=news-flows-nl.bsky.social posts=42 method=networkclustering-sbert threshold=0.2 windows=(cluster=7d, engagement=1d, push=1d)
   cluster=12 size=10 engagement=538 keywords="europe policy migration"
   cluster=4  size=8  engagement=410 keywords="covid vaccine health"
   cluster=9  size=6  engagement=295 keywords="energy gas price"
-  - demoted last-run URIs: 7
+  - demoted (time-window): 7
   - priorities: first=1000, decreasing by 1
 ```
 
@@ -247,15 +246,15 @@ Add `--dry-run` to print an intelligible summary and a priority preview instead 
 ```bash
 python -m blueskyranker.pipeline \
   --handles news-flows-nl.bsky.social \
-  --method networkclustering-tfidf --similarity-threshold 0.2 \
-  --cluster-window-days 7 --engagement-window-days 3 --push-window-days 1 \
+  --method networkclustering-sbert --similarity-threshold 0.2 \
+  --cluster-window-days 7 --engagement-window-days 1 --push-window-days 1 \
   --dry-run
 ```
 
 Sample output (abbreviated):
 
 ```
-=== Dry Run: handle=news-flows-nl.bsky.social posts=42 method=networkclustering-tfidf threshold=0.2 windows=(cluster=7d, engagement=3d, push=1d)
+=== Dry Run: handle=news-flows-nl.bsky.social posts=42 method=networkclustering-sbert threshold=0.2 windows=(cluster=7d, engagement=1d, push=1d)
   cluster=12 size=10 engagement=538 keywords="europe policy migration"
   cluster=4  size=8  engagement=410 keywords="covid vaccine health"
   cluster=9  size=6  engagement=295 keywords="energy gas price"
@@ -272,7 +271,7 @@ Background: previously pushed high-priority posts could linger at the top until 
 
 - Enable/disable via CLI: `--demote-last` (default) / `--no-demote-last`.
 - Window: by default, considers the last 48 hours. Configure via `--demote-window-hours 48`.
-- Logging: `push.log` shows `demoted last-run URIs: <count>`.
+- Logging: `push.log` rotates and shows `demoted (time-window): <count>`.
 - Export: the per-run JSON in `push_exports/` includes `counts.demoted`.
 
 Notes:
@@ -293,7 +292,7 @@ Programmatic
 ```python
 from blueskyranker.cluster_report import generate_cluster_report
 generate_cluster_report(db_path='newsflows.db', output_path='cluster_report.md',
-                        method='networkclustering-tfidf', sample_max=600,
+                        method='networkclustering-sbert', sample_max=600,
                         similarity_threshold=0.2, vectorizer_stopwords='english')
 ```
 
@@ -333,8 +332,7 @@ For example: `push_news-flows-nl_bsky_social_2025-09-15T14-50-24Z.json`.
 
 The pipeline’s fetch step refreshes engagement metrics for all posts within the effective window by default. The effective fetch window is `max(cluster_window_days, engagement_window_days, push_window_days)` unless overridden via `--fetch-max-age-days`.
 
-- Default: `--refresh-window` is enabled, which re-fetches the entire effective window and upserts to SQLite (updating likes/replies/quotes/reposts).
-- To opt out (incremental only): pass `--no-refresh-window` (will fetch only posts newer than the latest in DB and not refresh older rows inside the window).
+- Pipeline always refreshes the engagement/push window and then extends to provide the cluster context; no pipeline flag is needed.
 
 ### Time handling
 

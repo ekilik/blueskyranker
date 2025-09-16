@@ -5,3 +5,4 @@ igraph
 tqdm
 atproto
 python-dotenv
+sentence-transformers
