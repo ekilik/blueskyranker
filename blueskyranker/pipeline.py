@@ -19,7 +19,6 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from logging.handlers import RotatingFileHandler
 
 import polars as pl
 
@@ -36,7 +35,8 @@ def _ensure_push_logger(log_path: str = "push.log") -> logging.Logger:
     logger = logging.getLogger('BSRpush')
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        fh = RotatingFileHandler(log_path, encoding='utf-8', maxBytes=5_000_000, backupCount=7)
+        # Use a plain FileHandler (no rotation) so logs are never auto-deleted.
+        fh = logging.FileHandler(log_path, encoding='utf-8')
         fmt = logging.Formatter('%(asctime)s %(levelname)-8s %(message)s', datefmt='%Y-%m-%dT%H:%M:%S%z')
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -259,6 +259,7 @@ def run_fetch_rank_push(
         else:
             demote_uris = []
         demoted_count = len(demote_uris)
+        
         # Compute simple cluster stats
         # Build top cluster summary derived from the ranker's fields to ensure consistency
         agg = (

@@ -271,7 +271,7 @@ Background: previously pushed high-priority posts could linger at the top until 
 
 - Enable/disable via CLI: `--demote-last` (default) / `--no-demote-last`.
 - Window: by default, considers the last 48 hours. Configure via `--demote-window-hours 48`.
-- Logging: `push.log` rotates and shows `demoted (time-window): <count>`.
+- Logging: `push.log` grows without rotation (no files are auto-deleted) and shows `demoted (time-window): <count>`.
 - Export: the per-run JSON in `push_exports/` includes `counts.demoted`.
 
 Notes:
