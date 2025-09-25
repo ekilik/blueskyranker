@@ -148,8 +148,8 @@ class _BaseRanker():
             return False
 
         # Prepare readable filename components
-        safe_handle = (handle or 'unknown').replace('.', '_')
-        ts_readable = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+        safe_handle = (handle or 'unknown').replace('.', '_').replace(' ', '_')
+        ts_readable = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
 
         # Try to parse as JSON; fall back to text
         resp_json = None
