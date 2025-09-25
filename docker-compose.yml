@@ -1,0 +1,24 @@
+services:
+  blueskyranker:
+    image: jbgruber/blueskyranker
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: blueskyranker
+    volumes:
+      # Mount your .env file to be accessible by the application
+      - ./.env:/app/.env
+      - ./logs:/app/push_exports
+    # environment:
+      # Alternatively, you can set environment variables directly here
+      # FEEDGEN_HOSTNAME: "your-feedgen-host.com"
+      # PRIORITIZE_API_KEY: "your-api-key"
+    restart: unless-stopped
+    # limits resources to not disturb more critical processes on server
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1gb
+    # To run an alternative command, uncomment and modify the line below:
+    # command: ["python", "-m", "blueskyranker.pipeline", "--similarity-threshold", "0.3", "--test"]

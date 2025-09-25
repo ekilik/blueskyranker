@@ -233,3 +233,6 @@ validation/
 cluster_report.md
 validation_exports/
 *.db
+
+# dir with push logs
+logs/
