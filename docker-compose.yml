@@ -5,6 +5,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: blueskyranker
+    network_mode: "host"
     volumes:
       # Mount your .env file to be accessible by the application
       - ./.env:/app/.env
@@ -20,5 +21,14 @@ services:
         limits:
           cpus: '1.0'
           memory: 1gb
+    environment:
+      # Limit threading for common ML libraries
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMBA_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+      # Limit Python's threading
+      PYTHONHASHSEED: "0"
     # To run an alternative command, uncomment and modify the line below:
     # command: ["python", "-m", "blueskyranker.pipeline", "--similarity-threshold", "0.3", "--test"]
