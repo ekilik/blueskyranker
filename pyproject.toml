@@ -3,7 +3,7 @@ requires = ["hatchling >= 1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "NEWSFLOWS Bluesky Feed Ranker"
+name = "blueskyranker"
 version = "0.0.1"
 authors = [
   { name="Damian Trilling", email="d.c.trilling@vu.nl" },
