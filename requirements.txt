@@ -7,3 +7,4 @@ atproto
 python-dotenv
 sentence-transformers
 newspaper4k
+lxml[html_clean]
