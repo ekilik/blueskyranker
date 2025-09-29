@@ -6,3 +6,4 @@ tqdm
 atproto
 python-dotenv
 sentence-transformers
+newspaper4k

@@ -24,6 +24,8 @@ from collections import defaultdict
 from atproto import Client, models
 from tqdm import tqdm
 
+import newspaper
+
 import logging
 
 logger = logging.getLogger('BSRlog')
@@ -37,7 +39,7 @@ CSV_HEADERS = [
     "uri","cid","author_handle","author_did","indexedAt","createdAt","text",
     "reply_root_uri","reply_parent_uri","is_repost",
     "like_count","repost_count","reply_count","quote_count",
-    "news_title","news_description","news_uri"
+    "news_title","news_description","news_uri","news_content" 
 ]
 
 # SQLite helpers
@@ -64,7 +66,8 @@ def ensure_db(path: str) -> sqlite3.Connection:
             quote_count INTEGER,
             news_title TEXT,
             news_description TEXT,
-            news_uri TEXT
+            news_uri TEXT,
+            news_content TEXT
         )
         """
     )
@@ -85,7 +88,7 @@ def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
         return 0
     # Normalize embed fields: store NULL for empty strings
     def _norm(r: Dict[str, Any]) -> Dict[str, Any]:
-        for k in ("news_title", "news_description", "news_uri"):
+        for k in ("news_title", "news_description", "news_uri", "news_content"):
             v = r.get(k)
             if isinstance(v, str) and v.strip() == "":
                 r[k] = None
@@ -278,6 +281,20 @@ def extract_news_embed(item_post: Any, record: Any) -> Tuple[Optional[str], Opti
 
     return (None, None, None)
 
+def extract_article_content(news_uri: Optional[str], timeout: int = 10) -> Optional[str]:
+    """Fetch the news_uri and extract main article text using newspaper4k.
+    Returns the article text or None on failure.
+    """
+    try:
+        article = newspaper.Article(news_uri)
+        article.download()
+        article.parse()
+        text = article.text
+        return text if text.strip() else None
+    except Exception as e:
+        logger.debug(f"Failed to extract article content from {news_uri}: {e}")
+        return None
+
 def _parse_and_normalise_created_at(created_at: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
     """Parse a source timestamp into canonical UTC string and epoch nanoseconds.
 
@@ -304,7 +321,7 @@ def _parse_and_normalise_created_at(created_at: Optional[str]) -> Tuple[Optional
     return iso, ns
 
 
-def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost) -> Dict[str, Any]:
+def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost, extract_articles: bool = False) -> Dict[str, Any]:
     post = item.post
     record = getattr(post, "record", None)
     author = getattr(post, "author", None)
@@ -318,6 +335,12 @@ def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost) -> Dict[str, Any]:
     reply_parent_uri = get_uri(getattr(reply, "parent", None)) if reply else None
 
     news_title, news_description, news_uri = extract_news_embed(post, record)
+
+    if extract_articles and news_uri:    
+        news_content = extract_article_content(news_uri)
+        time.sleep(0.5)
+    else:
+        news_content = None
 
     # Normalise createdAt and compute epoch ns
     created_iso, created_ns = _parse_and_normalise_created_at(getattr(record, "created_at", None) if record else None)
@@ -341,6 +364,7 @@ def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost) -> Dict[str, Any]:
         "news_title": news_title,
         "news_description": news_description,
         "news_uri": news_uri,
+        "news_content": news_content,
     }
 
 def fetch_author_feed_all(
@@ -350,6 +374,7 @@ def fetch_author_feed_all(
     include_pins: bool,
     cutoff_dt: Optional[datetime],
     cutoff_check_every: int = 1,
+    extract_articles: bool = False, 
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch all pages for one handle, honoring cutoff_dt (createdAt >= cutoff_dt).
@@ -428,7 +453,7 @@ def fetch_author_feed_all(
 
         # Always keep in-window posts on this page
         for item in page_keep:
-            flat = flatten_item(item)
+            flat = flatten_item(item, extract_articles)  
             # Track empty-string anomalies in embed fields
             if isinstance(flat.get("news_title"), str) and flat["news_title"].strip() == "":
                 embed_empty_title += 1
@@ -436,6 +461,7 @@ def fetch_author_feed_all(
                 embed_empty_desc += 1
             if isinstance(flat.get("news_uri"), str) and flat["news_uri"].strip() == "":
                 embed_empty_uri += 1
+            
 
             rows.append(flat)
             total_posts += 1
@@ -579,9 +605,6 @@ def final_report(per_handle_stats: List[Dict[str, Any]]) -> str:
     
     return "\n".join(lines)
 
-
-
-
 class Fetcher():
     """Fetcher to get public Bluesky posts with max-age cutoff, incremental updates, and embed extraction.
 
@@ -596,6 +619,7 @@ class Fetcher():
         include_pins=False,
         sqlite_path: Optional[str] = None,
         refresh_window: bool = False,
+        extract_articles: bool = False,
         ):
         if handles is None:
             handles = [
@@ -614,6 +638,7 @@ class Fetcher():
         include_pins (bool): Include pinned posts at the top
         sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db)
         refresh_window (bool): If True, re-fetch the entire N-day window even if posts already exist in DB (refresh engagement metrics). If False (default), fetch incrementally from the latest saved timestamp.
+        extract_articles (bool): If True, extract full article text from news URLs (default: False). This significantly slows down fetching.
         """
 
         db_path = sqlite_path or "newsflows.db"
@@ -649,6 +674,7 @@ class Fetcher():
                 include_pins=include_pins,
                 cutoff_dt=cutoff_dt,
                 cutoff_check_every=cutoff_check_every,
+                extract_articles=extract_articles, 
             )
 
             # Upsert all rows for this handle
@@ -729,17 +755,24 @@ def main():
         action="store_true",
         help="Re-fetch the entire N-day window (refresh engagement), ignoring latest saved timestamp."
     )
+    parser.add_argument(
+    "--extract-articles",
+    action="store_true",
+    help="Extract full article text from news URLs (probably will slow down fetching significantly)."
+    )
+
     parser.set_defaults(include_pins=False)
     args = parser.parse_args()
 
     fetcher = Fetcher(args.xrpc_base)
     results = fetcher.fetch(
-        handles = args.handles,
-        max_age_days=args.max_age_days,
-        cutoff_check_every=args.cutoff_check_every,
-        include_pins=args.include_pins,
-        sqlite_path=args.sqlite_path,
-        refresh_window=args.refresh_window,
+    handles = args.handles,
+    max_age_days=args.max_age_days,
+    cutoff_check_every=args.cutoff_check_every,
+    include_pins=args.include_pins,
+    sqlite_path=args.sqlite_path,
+    refresh_window=args.refresh_window,
+    extract_articles=args.extract_articles, 
     )
     print(results)
 
