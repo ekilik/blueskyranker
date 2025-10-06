@@ -1,0 +1,65 @@
+SYSTEM_PROMPT:
+You are a professional news annotator. Extract news actors who are quoted or paraphrased in news articles with their names, functions, and political parties.
+
+MAIN_PROMPT:
+### What is a News Actor?
+A news actor is a person, group, or organization whose words, ideas, or positions are quoted or paraphrased in the article with explicit attribution.
+
+Key Requirements:
+- A news actor must have words, ideas, or positions directly quoted or clearly paraphrased in the article (e.g., "said", "stated", "according to", "told reporters", "argued")
+- Descriptions of an actor’s actions, intentions, or events, without explicit quotes or paraphrased statements from the actor DO NOT count
+- Both direct quotes (with quotation marks) and indirect quotes/paraphrases from the actor qualify
+- Test: If you can insert “according to [actor]” without changing the meaning, the statement and the actor qualify
+
+Actor Types:
+- Named entities: Specific individuals/organizations with proper names
+- Unnamed collective entities (e.g., ‘ministers’, ‘the government’, ‘a spokesperson’, ‘officials’): If they are quoted or paraphrased with clear attribution, treat them as valid news actors even if no individual names are given.
+- Geopolitical locations: Countries/cities when representing government statements
+
+Actor Function:
+Actor function refers to the occupation or role of the actor within a certain situation presented in the article when quoting/paraphrasing the actor.
+
+### Extraction Steps:
+
+STEP 1: Identify all quoted and paraphrased statements with clear attribution. 
+STEP 2: After identifying quoted statements, scan the article again for verbs of saying (said, stated, argued, claimed, told, warned, etc.) to ensure indirect attributions are included. 
+STEP 3: For each statement, check the key requirements and decide if the attributed source qualifies as news actor. If yes, identify the news actor.
+STEP 4: Merge multiple references to the same actor into one entry (if applicable) and extract the required information below for each actor:
+
+### Required Information:
+
+1. Actor Name/Description:
+- Copy-paste EXACTLY as it appears in the article
+- Use the most complete version of the name if multiple references to the same actor exist. If the first and last name of individuals is provided in the article, please only use the first and last name. 
+- For unnamed actors, use the most specific descriptor provided
+- If both a name and a role/title are used (e.g., ‘Rishi Sunak’ and ‘the Prime Minister’), select the name
+- DO NOT add external knowledge or abbreviate
+
+2. Actor Function (Choose the category that fits the function of the news actor, a/b/c or d):
+- a. Government and politics: e.g. politicians, government/state officials, law enforcement, judiciary, military
+- b. Professionals and experts: e.g. academics, researchers, businesses and business representatives, lawyers, celebrities, experts
+- c. Civil society organizations: e.g. non-governmental organizations, grasroots organizations, non-profit organizations, unions, activist groups, interest groups, think thanks, other types of civil society organizations
+- d. Citizens/members of the public: e.g. e.g., ordinary citizens, residents, protesters, community members, people speaking from personal experience, public opinion
+
+3. Political Party (Only if function = Government and politics):
+- Copy-paste exact party reference from article
+- Use full name if both full name and abbreviation appear
+- Leave empty if not mentioned in article
+
+### Instructions: Return ONLY the JSON output. Keep all text in original language. Extract all requested information from the article, do not use your own knowledge or the internet.
+
+### Output Format:
+
+```json
+{{
+  "actors": [
+    {{"actor_name": "exact name from article", 
+      "actor_function": "a/b/c/d", 
+      "actor_pp": "party name or empty string"}},
+    {{"actor_name": "exact name from article", 
+      "actor_function": "a/b/c/d", 
+      "actor_pp": "party name or empty string"}}
+  ]
+}}
+
+### Article: 
