@@ -12,3 +12,4 @@ ollama
 spacy
 json
 re
+pandas

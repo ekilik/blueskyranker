@@ -8,6 +8,7 @@ import time
 from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 import ollama
+import spacy
 
 ###TODO: currently writes the annotated file, maybe not needed? 
 ###TODO: hardcoded column names, wait time between model calls, minimum text length
@@ -21,6 +22,10 @@ class ActorAnnotator():
         self.main_prompt = None
         self._model_checked = False
         self._load_prompts()
+
+        # Validate prompts were loaded successfully
+        if not self.system_prompt or not self.main_prompt:
+            raise ValueError("Failed to load required prompts. Check if actor_extraction_prompt.txt exists and is properly formatted.")
 
     def _load_prompts(self):
         """Load system and main prompts from file"""
@@ -98,7 +103,7 @@ class ActorAnnotator():
             ollama_model = self.model_name
             
         if not news_content or len(news_content.strip()) < 50:
-            return None    
+            return json.dumps({'actors': []})    
 
         if not self.system_prompt or not self.main_prompt:
             print("Prompts not loaded properly")
@@ -227,21 +232,19 @@ class ActorAnnotator():
         
         return actors
     
-    # Update process_articles_batch to accept text_column parameter
-    def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str = 'text') -> List[Optional[str]]:
+    def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str, id_column: str) -> List[Optional[str]]:
         """Process a batch of articles and return actor extraction results"""
         results = []
         for idx, row in df_batch.iterrows():
-            uri = row.get('uri', None)
+            uri = row.get(id_column, idx)
             text = row.get(text_column, '')
-            print(f"Processing post {uri}...")
+            print(f"Processing post ID: {uri}...")
             actors_json = self.extract_actors_from_content(text)
             results.append(actors_json)
             time.sleep(0.5)  
         return results
     
-    def process_dataframe(self, df: pd.DataFrame, text_column: str = 'article_fulltext', 
-                    id_column: str = 'uri') -> pd.DataFrame:
+    def process_dataframe(self, df: pd.DataFrame, text_column: str, id_column: str) -> pd.DataFrame:
         """
         Process a DataFrame and return it with actors column added.
         For in-memory processing without file output.
@@ -255,8 +258,7 @@ class ActorAnnotator():
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
             uri = row.get(id_column, idx)
             text = row.get(text_column, '')
-            
-            print(f"Processing post {uri}...")
+            print(f"Processing post ID: {uri}...")
             actors_json = self.extract_actors_from_content(text)
             actors_results.append(actors_json)
             
@@ -264,70 +266,7 @@ class ActorAnnotator():
             time.sleep(0.5)
         
         df_result['news_actors'] = actors_results
-        return df_result
-
-    @staticmethod
-    def parse_actors_json(actors_json_str):
-        """Parse the JSON string and extract actor lists"""
-        if pd.isna(actors_json_str):
-            return [], [], []
-        try:
-            data = json.loads(actors_json_str)
-            actors = data.get('actors', [])
-            
-            names = [actor.get('actor_name', '') for actor in actors]
-            functions = [actor.get('actor_function', '') for actor in actors] 
-            parties = [actor.get('actor_pp', '') for actor in actors]
-            
-            return names, functions, parties
-        except (json.JSONDecodeError, AttributeError):
-            return [], [], []
-        
-    @staticmethod
-    def expand_actors_to_rows(df):
-        """
-        Transform DataFrame from article-level to actor-level.
-        Each actor becomes a separate row with article metadata.
-        """
-
-        df_copy = df.copy()
-        parsed_data = df_copy['news_actors'].apply(ActorAnnotator.parse_actors_json)
-        
-        df_copy['actor_name'] = [x[0] for x in parsed_data]
-        df_copy['actor_function'] = [x[1] for x in parsed_data] 
-        df_copy['actor_pp'] = [x[2] for x in parsed_data]
-        
-        expanded_rows = []
-        
-        for idx, row in df_copy.iterrows():
-            # Skip rows with no actors
-            if pd.isna(row['news_actors']) or len(row['actor_name']) == 0:
-                continue
-                
-            # Get the number of actors for this article
-            num_actors = len(row['actor_name'])
-            
-            # Create a row for each actor
-            for i in range(num_actors):
-                actor_row = {
-                    'uri': row['uri'],
-                    'text': row['text'],
-                    'news_title': row['news_title'],
-                    'news_description': row['news_description'],
-                    'news_uri': row['news_uri'],
-                    'news_content': row['news_content'],
-                    # Add individual actor data
-                    'actor_name': row['actor_name'][i] if i < len(row['actor_name']) else '',
-                    'actor_function': row['actor_function'][i] if i < len(row['actor_function']) else '',
-                    'actor_pp': row['actor_pp'][i] if i < len(row['actor_pp']) else '',
-                    # Add actor index for reference
-                    'actor_index': i + 1,
-                    'total_actors_in_article': num_actors
-                }
-                expanded_rows.append(actor_row)
-        
-        return pd.DataFrame(expanded_rows)
-    
+        return df_result   
 
     def chunk_dataframe(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
         """Split dataframe into chunks for batch processing"""
@@ -335,78 +274,172 @@ class ActorAnnotator():
     
 
     def process_all_batches(self, df: pd.DataFrame, batch_size: int, 
-                        output_file_path: str, text_column: str = 'full_text') -> None:
-        """Process all batches, expand actors, and save reorganized results to CSV file"""
-        # Prepare unique articles
-        unique_articles = df[['uri', text_column]].drop_duplicates(subset=['uri']).reset_index(drop=True)
-        
-        # Keep other columns for merging back
-        article_metadata = df.drop_duplicates(subset=['uri']).set_index('uri')
-        
-        batches = self.chunk_dataframe(unique_articles, batch_size)
+                        output_file_path: str, text_column: str, id_column: str) -> None:
+        """Process all batches, expand df to actor level, and save reorganized results to CSV file"""
 
-        # Free memory from original dataframe
-        del df
+        batches = self.chunk_dataframe(df, batch_size)
         
-        # Remove existing output file if it exists to start fresh
-        if os.path.exists(output_file_path):
-            os.remove(output_file_path)
-        
-        # Track if we've written headers yet
         header_written = False
         
         for batch_idx, batch in enumerate(tqdm(batches, desc="Processing batches")):
             print(f"Processing batch {batch_idx + 1}/{len(batches)} ({len(batch)} articles)")
             
-            # Step 1: Extract actors
-            batch_results = self.process_articles_batch(batch, text_column)
+            # Extract actors
+            batch_results = self.process_articles_batch(batch, text_column, id_column)
             batch['news_actors'] = batch_results
             
-            # Step 2: Merge back with original article metadata
-            batch_with_metadata = batch.merge(
-                article_metadata, 
-                left_on='uri', 
-                right_index=True, 
-                how='left'
+            # Expand actors to individual rows
+            expanded_batch = expand_actors_to_rows(batch, id_column)
+        
+            expanded_batch.to_csv(
+                output_file_path, 
+                mode='a',
+                header=not header_written,
+                index=False, 
+                sep=';', 
+                quoting=csv.QUOTE_NONNUMERIC
             )
-            
-            # Step 3: Expand actors to individual rows
-            expanded_batch = self.expand_actors_to_rows(batch_with_metadata)
-            
-            # Step 4: Only save if we have actors
-            if not expanded_batch.empty:
-                expanded_batch.to_csv(
-                    output_file_path, 
-                    mode='a',
-                    header=not header_written,
-                    index=False, 
-                    sep=';', 
-                    quoting=csv.QUOTE_NONNUMERIC
-                )
-                header_written = True
-                print(f"Batch {batch_idx + 1} processed: {len(expanded_batch)} actor rows appended")
-            else:
-                print(f"Batch {batch_idx + 1} contained no actors, skipping...")
+            header_written = True
+            print(f"Batch {batch_idx + 1} processed: {len(expanded_batch)} actor rows appended")
         
         print(f"All batches completed! Check {output_file_path} for final actor-level results.")
 
 
-def load_data(data_path: str, text_column: str = 'text', 
-             title_column: str = 'title') -> pd.DataFrame:
+def load_data(data_path: str, text_column: str, title_column: str, id_column: str) -> pd.DataFrame:
     """Load and prepare data from CSV"""
     df = pd.read_csv(data_path, encoding='utf-8-sig', sep=';', quoting=csv.QUOTE_NONNUMERIC)
-    df['uri'] = df['uri'].astype(int)
-    # make all colnames lowercase
+        
+    # Validate required columns exist
+    required_cols = [text_column, title_column, id_column]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Required columns not found: {missing_cols}. Available: {list(df.columns)}")
     
-    df['full_text'] = df[title_column.lower()].fillna('') + '\n\n' + df[text_column.lower()].fillna('')
+    # Create full_text column
+    df['full_text'] = (df[title_column].fillna('').astype(str) + '\n' + 
+                      df[text_column].fillna('').astype(str)) 
     df['full_text'] = df['full_text'].str.replace(',external', ' ', regex=False)
     df['full_text'] = df['full_text'].str.strip()
     df['full_text'] = df['full_text'].str.replace('\n+', '\n', regex=True)
     df['full_text'] = df['full_text'].str.replace(' +', ' ', regex=True)
+
+    # Drop unnecessary columns to save memory
+    columns_to_keep = [id_column, 'full_text']
+    df = df[columns_to_keep].copy()
         
     return df
 
+def parse_actors_json(actors_json_str):
+    """Parse the JSON string and extract actor lists"""
+    if pd.isna(actors_json_str):
+        return [], [], []
+    try:
+        data = json.loads(actors_json_str)
+        actors = data.get('actors', [])
+        
+        names = [actor.get('actor_name', '') for actor in actors]
+        functions = [actor.get('actor_function', '') for actor in actors] 
+        parties = [actor.get('actor_pp', '') for actor in actors]
+        
+        return names, functions, parties
+    except (json.JSONDecodeError, AttributeError):
+        return [], [], []
+    
+def expand_actors_to_rows(df, id_column: str):
+    """
+    Transform DataFrame from article-level to actor-level.
+    Each actor becomes a separate row with article metadata.
+    Memory-efficient version using generator and chunked processing.
+    Articles without actors get a row with missing values in actor columns.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Validate that the ID column exists
+    if id_column not in df.columns:
+        raise ValueError(f"ID column '{id_column}' not found in DataFrame. Available columns: {list(df.columns)}")
+    
+    def generate_actor_rows():
+        """Generator that yields actor rows one at a time"""
+        for idx, row in df.iterrows():
+            # Parse actors for this row
+            names, functions, parties = parse_actors_json(row['news_actors'])
+            
+            # If no actors found, create one row with missing values
+            if len(names) == 0:
+                yield {
+                    id_column: row[id_column],
+                    'actor_name': '',
+                    'actor_function': '',
+                    'actor_pp': ''
+                }
+            else:
+                # Yield each actor as a separate row
+                for i in range(len(names)):
+                    yield {
+                        id_column: row[id_column],
+                        'actor_name': names[i] if i < len(names) else '',
+                        'actor_function': functions[i] if i < len(functions) else '',
+                        'actor_pp': parties[i] if i < len(parties) else ''
+                    }
+    
+    # Create DataFrame from generator (more memory efficient)
+    return pd.DataFrame(generate_actor_rows())
+
+def clean_actor_name(name):
+    # Remove text in parentheses
+    return re.sub(r"\(.*?\)", "", name).strip()
+ 
+def extract_core_name(full_name, spacy_model: str):
+    """
+    Use NER to decide if this is a PERSON or ORG/GPE.
+    - For PERSON: return the detected person name
+    - For ORG/GPE: return cleaned organization name
+    - Otherwise: return None (generic actor)
+    """
+    if pd.isna(full_name) or not full_name.strip():
+        return None
+        
+    clean_name = clean_actor_name(full_name)
+    
+    # Try to load the model, download if not available
+    try:
+        nlp = spacy.load(spacy_model)
+    except OSError:
+        print(f"spaCy model '{spacy_model}' not found. Downloading...")
+        try:
+            import subprocess
+            # Use subprocess instead of spacy.cli
+            subprocess.run([
+                "python", "-m", "spacy", "download", spacy_model
+            ], check=True)
+            print(f"Successfully downloaded '{spacy_model}'")
+            # Load the model after download
+            nlp = spacy.load(spacy_model)
+        except Exception as e:
+            print(f"Failed to download spaCy model '{spacy_model}': {e}")
+            print("Please install manually")
+            return None
+    except Exception as e:
+        print(f"Error loading spaCy model: {e}")
+        return None
+    
+    doc = nlp(clean_name)
+
+    # Look for named entities
+    for ent in doc.ents:
+        if ent.label_ in ["PERSON", "ORG", "GPE"]:
+            return ent.text.title()
+    
+    # fallback: if no entity found, return the name
+    return clean_name.title()
+
 def main(args):
+    # Validate input file exists
+    if not os.path.exists(args.data_path):
+        print(f"Error: Input file not found: {args.data_path}")
+        return
+    
     # Initialize annotator
     annotator = ActorAnnotator(
         model_name=args.model_name,
@@ -414,24 +447,29 @@ def main(args):
         gpu=args.gpu
     )
     
-    # Load data
+    # Load data with explicit arguments
     try:
         print(f"Loading data from {args.data_path}...")
-        df = load_data(args.data_path, args.text_column, args.title_column)
+        df = load_data(
+            data_path=args.data_path, 
+            text_column=args.text_column, 
+            title_column=args.title_column,
+            id_column=args.id_column
+        )
         print(f"Loaded {len(df)} articles")
     except Exception as e:
         print(f"Failed to load data: {e}")
         return
     
-    # Process all batches 
+    # Process all batches with explicit arguments
     print(f"Starting batch processing with batch size {args.batch_size}...")
     annotator.process_all_batches(
         df=df,
         batch_size=args.batch_size,
         output_file_path=args.output_file_path,
-        text_column='full_text'  
+        text_column='full_text',  # We know this is created in load_data()
+        id_column=args.id_column
     )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch process actor annotations")
@@ -440,6 +478,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, required=True, help="Path to input CSV data file")
     parser.add_argument('--text_column', type=str, default='text', help="Column name containing article text")
     parser.add_argument('--title_column', type=str, default='title', help="Column name containing article title")
+    parser.add_argument('--id_column', type=str, default='uri', help="Column name containing unique article ID")
     parser.add_argument('--output_file_path', type=str, required=True, help="Path to output CSV file")
     parser.add_argument('--batch_size', type=int, default=10, help="Number of articles to process per batch")
     parser.add_argument('--model_name', type=str, default='gpt-oss:20b', help="Ollama model name")
