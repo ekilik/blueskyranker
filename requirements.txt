@@ -8,3 +8,7 @@ python-dotenv
 sentence-transformers
 newspaper4k
 lxml-html-clean
+ollama
+spacy
+json
+re
