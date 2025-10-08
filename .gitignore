@@ -234,5 +234,17 @@ cluster_report.md
 validation_exports/
 *.db
 
-# dir with push logs
+*.db-shm
+*.db-wal
+newsflows.db
+
+# Runtime logs and exports
+push.log
 logs/
+push_exports/
+
+# Survey/data exports
+qualtrics/
+sbert_dry_run.txt
+blueskyranker/.env
+local_scripts/

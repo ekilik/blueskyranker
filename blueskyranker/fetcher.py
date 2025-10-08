@@ -20,6 +20,8 @@ import sqlite3
 import json
 import re
 from typing import List, Dict, Any, Optional, Tuple, Set
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -29,6 +31,27 @@ from tqdm import tqdm
 import logging
 
 logger = logging.getLogger('BSRlog')
+
+DEFAULT_SQLITE_PATH = str(Path(__file__).resolve().parent / "newsflows.db")
+
+
+class _HandleProgress(tqdm):
+    """tqdm wrapper that exposes a custom field for remaining window text."""
+
+    def __init__(self, *args, **kwargs):
+        self._left_to_fetch = "0d 0h"
+        super().__init__(*args, **kwargs)
+
+    @property
+    def format_dict(self):  # type: ignore[override]
+        d = super().format_dict
+        d['left_to_fetch'] = self._left_to_fetch
+        return d
+
+    def set_left_to_fetch(self, text: str, *, refresh: bool = False) -> None:
+        self._left_to_fetch = text
+        if refresh:
+            self.refresh()
 
 APPVIEW_XRPC = "https://public.api.bsky.app/xrpc"
 PAGE_LIMIT = 100
@@ -376,7 +399,11 @@ def fetch_author_feed_all(
     include_pins: bool,
     cutoff_dt: Optional[datetime],
     cutoff_check_every: int = 1,
-    extract_articles: bool = False
+    extract_articles: bool = False,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    handle_index: int = 1,
+    total_handles: int = 1,
+    disable_tqdm: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch all pages for one handle, honoring cutoff_dt (createdAt >= cutoff_dt).
@@ -404,7 +431,14 @@ def fetch_author_feed_all(
     embed_empty_uri = 0
 
     cursor: Optional[str] = None
-    page_bar = tqdm(desc=f"[{actor}] pages", unit="page", dynamic_ncols=True, leave=False)
+    page_bar = _HandleProgress(
+        desc=actor,
+        unit="page",
+        dynamic_ncols=True,
+        leave=False,
+        bar_format='[{desc}]: {n_fmt} | left to fetch: {left_to_fetch} [{elapsed}, {rate_fmt}]',
+        disable=disable_tqdm,
+    )
 
     def within_window(created_at: Optional[str]) -> bool:
         if cutoff_dt is None:
@@ -415,6 +449,22 @@ def fetch_author_feed_all(
     # Retry configuration (exponential backoff with jitter)
     max_retries = 3
     base_delay = 0.5
+
+    if progress_callback:
+        try:
+            progress_callback(
+                {
+                    "event": "handle_start",
+                    "handle": actor,
+                    "handle_index": handle_index,
+                    "total_handles": total_handles,
+                    "pages": 0,
+                    "posts_handle": 0,
+                    "posts_global": int(getattr(posts_pbar, "n", 0)),
+                }
+            )
+        except Exception:
+            logger.debug("progress_callback(handle_start) failed", exc_info=True)
 
     while True:
         params = models.AppBskyFeedGetAuthorFeed.Params(
@@ -492,15 +542,37 @@ def fetch_author_feed_all(
         cursor = resp.cursor
         pages += 1
 
-        # Page bar description with last seen timestamp and window status
-        status_suffix = ""
+        # Update per-handle progress message with remaining window time
+        remaining_str = "0d 0h"
         if last_created_seen:
             dt_seen = iso_to_dt(last_created_seen)
-            if dt_seen:
-                w = (cutoff_dt is None) or (dt_seen >= cutoff_dt)
-                status_suffix = f" — last: {dt_seen.isoformat()} — within window: {'yes' if w else 'no'}"
-        page_bar.set_description(f"[{actor}] pages{status_suffix}")
+            if dt_seen and cutoff_dt is not None:
+                delta = dt_seen - cutoff_dt
+                if delta.total_seconds() < 0:
+                    delta = timedelta(0)
+                days = delta.days
+                hours = delta.seconds // 3600
+                remaining_str = f"{days}d {hours}h"
+            elif dt_seen:
+                remaining_str = "0d 0h"
+        page_bar.set_left_to_fetch(remaining_str)
         page_bar.update(1)
+
+        if progress_callback:
+            try:
+                progress_callback(
+                    {
+                        "event": "page",
+                        "handle": actor,
+                        "handle_index": handle_index,
+                        "total_handles": total_handles,
+                        "pages": pages,
+                        "posts_handle": total_posts,
+                        "posts_global": int(getattr(posts_pbar, "n", 0)),
+                    }
+                )
+            except Exception:
+                logger.debug("progress_callback(page) failed", exc_info=True)
 
         # Early-stop decision: if nothing on the page was in-window AND it's time to check
         all_outside = (cutoff_dt is not None and not page_keep)
@@ -515,6 +587,23 @@ def fetch_author_feed_all(
 
     page_bar.close()
     elapsed = time.perf_counter() - handle_start
+
+    if progress_callback:
+        try:
+            progress_callback(
+                {
+                    "event": "handle_done",
+                    "handle": actor,
+                    "handle_index": handle_index,
+                    "total_handles": total_handles,
+                    "pages": pages,
+                    "posts_handle": total_posts,
+                    "posts_global": int(getattr(posts_pbar, "n", 0)),
+                    "elapsed": elapsed,
+                }
+            )
+        except Exception:
+            logger.debug("progress_callback(handle_done) failed", exc_info=True)
     rate = total_posts / elapsed if elapsed > 0 else 0.0
 
     stats = {
@@ -621,7 +710,8 @@ class Fetcher():
         include_pins=False,
         sqlite_path: Optional[str] = None,
         refresh_window: bool = False,
-        extract_articles: bool = False
+        extract_articles: bool = False,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         ):
         if handles is None:
             handles = [
@@ -639,22 +729,42 @@ class Fetcher():
         max_age_days (int): Only keep posts whose createdAt is within the last N days.
         cutoff_check_every (int)": How many pages between early-stop checks against the cutoff (default: 1 = check every page).
         include_pins (bool): Include pinned posts at the top
-        sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db)
+        sqlite_path (str|None): path to sqlite DB (default: blueskyranker/newsflows.db)
         refresh_window (bool): If True, re-fetch the entire N-day window even if posts already exist in DB (refresh engagement metrics). If False (default), fetch incrementally from the latest saved timestamp.
         extract_articles (bool): If True, extract full article text from news URLs (default: False). This significantly slows down fetching.
         """
 
-        db_path = sqlite_path or "newsflows.db"
+        db_path = sqlite_path or DEFAULT_SQLITE_PATH
         conn: sqlite3.Connection = ensure_db(db_path)
 
-        posts_pbar = tqdm(desc="Posts fetched (all handles)", unit="post", dynamic_ncols=True)
+        disable_tqdm = progress_callback is not None
+
+        posts_pbar = tqdm(
+            desc="Posts fetched (all handles)", unit="post", dynamic_ncols=True, disable=disable_tqdm
+        )
         combined_new_rows: List[Dict[str, Any]] = []
         per_handle_stats: List[Dict[str, Any]] = []
 
-        handles_pbar = tqdm(handles, desc="Handles", unit="handle", dynamic_ncols=True)
+        total_handles = len(handles)
+
+        handles_pbar = tqdm(
+            handles, desc="Handles", unit="handle", dynamic_ncols=True, disable=disable_tqdm
+        )
         start_all = time.perf_counter()
 
-        for handle in handles_pbar:
+        if progress_callback:
+            try:
+                progress_callback(
+                    {
+                        "event": "start",
+                        "total_handles": total_handles,
+                        "posts_global": 0,
+                    }
+                )
+            except Exception:
+                logger.debug("progress_callback(start) failed", exc_info=True)
+
+        for handle_index, handle in enumerate(handles_pbar, start=1):
             out_path = f"{handle.replace('.', '_')}_author_feed.csv"  # legacy filename for status messages only
 
             # Choose cutoff per handle
@@ -677,7 +787,11 @@ class Fetcher():
                 include_pins=include_pins,
                 cutoff_dt=cutoff_dt,
                 cutoff_check_every=cutoff_check_every,
-                extract_articles=extract_articles
+                extract_articles=extract_articles,
+                progress_callback=progress_callback,
+                handle_index=handle_index,
+                total_handles=total_handles,
+                disable_tqdm=disable_tqdm,
             )
 
             # Upsert all rows for this handle
@@ -685,15 +799,29 @@ class Fetcher():
             combined_new_rows.extend(handle_rows)
 
             # Report: how many NEW and their time frame
-            handles_pbar.write(
-                f"✅ DONE {handle}: upserted {len(handle_rows)} posts into SQLite"
-            )
+            if not disable_tqdm:
+                handles_pbar.write(
+                    f"✅ DONE {handle}: upserted {len(handle_rows)} posts into SQLite"
+                )
 
             # Keep scrape stats (before de-dup)
             per_handle_stats.append(stats)
 
         elapsed_all = time.perf_counter() - start_all
         posts_pbar.close()
+
+        if progress_callback:
+            try:
+                progress_callback(
+                    {
+                        "event": "finish",
+                        "total_handles": total_handles,
+                        "posts_global": int(getattr(posts_pbar, "n", 0)),
+                        "elapsed": elapsed_all,
+                    }
+                )
+            except Exception:
+                logger.debug("progress_callback(finish) failed", exc_info=True)
 
         logger.debug(
             f"\nSQLite upsert complete → {db_path} ({elapsed_all:.2f}s total)."
@@ -748,7 +876,7 @@ def main():
     )
     parser.add_argument(
         "--sqlite-path",
-        default="newsflows.db",
+        default=DEFAULT_SQLITE_PATH,
         help="Path to SQLite database file."
     )
     parser.add_argument(
@@ -773,7 +901,7 @@ def main():
     include_pins=args.include_pins,
     sqlite_path=args.sqlite_path,
     refresh_window=args.refresh_window,
-    extract_articles=args.extract_articles
+    extract_articles=args.extract_articles,
     )
     print(results)
 

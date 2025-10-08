@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 
 import polars as pl
 
-from .fetcher import Fetcher, ensure_db, load_posts_df
+from .fetcher import Fetcher, ensure_db, load_posts_df, DEFAULT_SQLITE_PATH
 from .ranker import TopicRanker
 
 import logging
@@ -69,7 +69,7 @@ def run_fetch_rank_push(
     fetch_max_age_days: Optional[int] = None,
     # Ranker options
     method: str = 'networkclustering-sbert',
-    similarity_threshold: float = 0.2,
+    similarity_threshold: float | None = None,
     vectorizer_stopwords: Optional[str | list[str]] = None,
     cluster_window_days: Optional[int] = 7,
     engagement_window_days: Optional[int] = 1,
@@ -81,17 +81,20 @@ def run_fetch_rank_push(
     test: bool = True,
     dry_run: bool = False,
     log_path: str = 'push.log',
+    dry_run_verbose: bool = True,
 ) -> None:
     """Fetch posts, rank per handle, and optionally push ranked posts.
 
-    The function performs a two‑phase fetch by default:
+    The function performs a two-phase fetch by default:
     1) Refresh engagement/push window to update engagement (likes/replies/quotes/reposts)
        that actually matters for ranking.
     2) Extend to the clustering window incrementally to provide sufficient context
        for topic clustering without refreshing older rows.
 
-    Ranking and ordering are window‑aware and deterministic. Exports and logs provide
-    a full audit trail of the data sent (or previewed in dry‑run mode).
+    Ranking and ordering are window-aware and deterministic. Exports and logs provide
+    a full audit trail of the data sent (or previewed in dry-run mode).
+    If no similarity threshold is supplied, the TopicRanker defaults to 0.5 for the
+    SBERT method and 0.2 for the TF-IDF / Count variants.
     """
     # Apply default handles if not provided
     if handles is None:
@@ -127,6 +130,10 @@ def run_fetch_rank_push(
 
     pushlog = _ensure_push_logger(log_path)
 
+    method_key = (method or '').lower()
+    if similarity_threshold is None:
+        similarity_threshold = 0.5 if method_key == 'networkclustering-sbert' else 0.2
+
     fetcher = Fetcher(xrpc_base)
     # Phase A: refresh engagement window (and push) to update engagement counts used for ranking
     if refresh_days is not None:
@@ -149,7 +156,7 @@ def run_fetch_rank_push(
             refresh_window=False,
         )
 
-    db_path = sqlite_path or 'newsflows.db'
+    db_path = sqlite_path or DEFAULT_SQLITE_PATH
     conn = ensure_db(db_path)
 
     # Migration: ensure createdAt_ns exists and is populated for robust time handling
@@ -447,36 +454,35 @@ def run_fetch_rank_push(
                 json.dump(export, f, ensure_ascii=False, indent=2)
             return out_path
         if dry_run:
-            # Display an intelligible summary and a small priority preview
-            print(f"\n=== Dry Run: handle={h} posts={pushed.height} method={method} threshold={similarity_threshold} windows=({windows_str})")
-            for tc in top_clusters:
-                kws = ' '.join(tc.get('keywords', [])) if tc.get('keywords') else ''
-                print(f"  cluster={tc['cluster']} rank={tc.get('rank')} size_push={tc.get('size_push',0)} engagement={tc.get('engagement',0)} keywords=\"{kws}\"")
-            if per_cluster_recent_lines:
-                print("  Top cluster posts (5 each):")
-                for line in per_cluster_recent_lines:
-                    print(f"    {line}")
-            preview = pushed.select([
-                # Higher numbers = higher priority (start at 1000)
-                (pl.lit(1000) - pl.arange(0, pl.len())).alias('priority'),
-                pl.col('cluster'),
-                pl.col('createdAt'),
-                pl.col('uri'),
-                pl.col('news_title'),
-            ]).with_columns(
-                pl.when(pl.col('priority') < 1).then(1).otherwise(pl.col('priority')).alias('priority')
-            ).head(15)
-            print("  Priority preview (top 15):")
-            for rec in preview.iter_rows(named=True):
-                title = (rec['news_title'] or '')
-                if isinstance(title, str) and len(title) > 80:
-                    title = title[:77] + '...'
-                print(f"    {rec['priority']:>3}  c={rec['cluster']:<4}  {rec['createdAt']}  {rec['uri']}  | {title}")
-            # Write JSON export for auditing the exact push order
             export_path = _export_json(pushed, demoted_count)
-            print(f"  JSON export: {export_path}")
+
+            if dry_run_verbose:
+                print(f"\n=== Dry Run: handle={h} posts={pushed.height} method={method} threshold={similarity_threshold} windows=({windows_str})")
+                for tc in top_clusters:
+                    kws = ' '.join(tc.get('keywords', [])) if tc.get('keywords') else ''
+                    print(f"  cluster={tc['cluster']} rank={tc.get('rank')} size_push={tc.get('size_push',0)} engagement={tc.get('engagement',0)} keywords=\"{kws}\"")
+                if per_cluster_recent_lines:
+                    print("  Top cluster posts (5 each):")
+                    for line in per_cluster_recent_lines:
+                        print(f"    {line}")
+                preview = pushed.select([
+                    (pl.lit(1000) - pl.arange(0, pl.len())).alias('priority'),
+                    pl.col('cluster'),
+                    pl.col('createdAt'),
+                    pl.col('uri'),
+                    pl.col('news_title'),
+                ]).with_columns(
+                    pl.when(pl.col('priority') < 1).then(1).otherwise(pl.col('priority')).alias('priority')
+                ).head(15)
+                print("  Priority preview (top 15):")
+                for rec in preview.iter_rows(named=True):
+                    title = (rec['news_title'] or '')
+                    if isinstance(title, str) and len(title) > 80:
+                        title = title[:77] + '...'
+                    print(f"    {rec['priority']:>3}  c={rec['cluster']:<4}  {rec['createdAt']}  {rec['uri']}  | {title}")
+                print(f"  JSON export: {export_path}")
+
             # Also log the summary for auditing purposes
-            # Build a cleaner, human-readable log block
             lines: List[str] = []
             lines.append(f"[DRY] handle={h} posts={pushed.height} method={method} threshold={similarity_threshold} windows=({windows_str})")
             # Counts summary for readability
@@ -515,6 +521,7 @@ def run_fetch_rank_push(
                         lines.append(f"       desc: \"{r['news_description']}\"")
             lines.append(f"JSON export: {export_path}")
             pushlog.info("\n".join(lines))
+            continue
         else:
             # Push using time‑window demotion computed above
             try:
@@ -585,11 +592,16 @@ def main():
     p.add_argument('--no-include-pins', dest='include_pins', action='store_false')
     p.set_defaults(include_pins=False)
     p.add_argument('--cutoff-check-every', type=int, default=1)
-    p.add_argument('--sqlite-path', default='newsflows.db')
+    p.add_argument('--sqlite-path', default=DEFAULT_SQLITE_PATH)
     p.add_argument('--fetch-max-age-days', type=int, default=None)
 
     p.add_argument('--method', default='networkclustering-sbert', choices=['networkclustering-tfidf','networkclustering-count','networkclustering-sbert'])
-    p.add_argument('--similarity-threshold', type=float, default=0.2)
+    p.add_argument(
+        '--similarity-threshold',
+        type=float,
+        default=None,
+        help='Override similarity cut-off; defaults to 0.5 for networkclustering-sbert, 0.2 otherwise',
+    )
     p.add_argument('--stopwords', default=None, help="'english' or comma-separated list; leave empty for None")
     p.add_argument('--cluster-window-days', type=int, default=7)
     p.add_argument('--engagement-window-days', type=int, default=1)
@@ -602,7 +614,10 @@ def main():
     p.add_argument('--test', action='store_true', default=True, help='Do not persist priorities on server')
     p.add_argument('--no-test', dest='test', action='store_false')
     p.add_argument('--dry-run', action='store_true', default=False, help='Print summary and priority preview instead of calling the API')
+    p.add_argument('--quiet-dry-run', dest='dry_run_verbose', action='store_false', help='Suppress console summary when using --dry-run')
+    p.add_argument('--dry-run-verbose', dest='dry_run_verbose', action='store_true', help='Show detailed dry-run summary (default)')
     p.add_argument('--log-path', default='push.log')
+    p.set_defaults(dry_run_verbose=True)
 
     args = p.parse_args()
 
@@ -629,6 +644,7 @@ def main():
         test=args.test,
         dry_run=args.dry_run,
         log_path=args.log_path,
+        dry_run_verbose=args.dry_run_verbose,
     )
 
 
