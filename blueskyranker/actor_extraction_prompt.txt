@@ -9,18 +9,17 @@ Key Requirements:
 - A news actor must have words, ideas, or positions directly quoted or clearly paraphrased in the article (e.g., "said", "stated", "according to", "told reporters", "argued")
 - Descriptions of an actor’s actions, intentions, or events, without explicit quotes or paraphrased statements from the actor DO NOT count
 - Both direct quotes (with quotation marks) and indirect quotes/paraphrases from the actor qualify
-- Test: If you can insert “according to [actor]” without changing the meaning, the statement and the actor qualify
+- Test: Can you add "according to [actor]" without changing meaning? If yes, it's a news actor
 
 Actor Types:
 - Named entities: Specific individuals/organizations with proper names
-- Unnamed collective entities (e.g., ‘ministers’, ‘the government’, ‘a spokesperson’, ‘officials’): If they are quoted or paraphrased with clear attribution, treat them as valid news actors even if no individual names are given.
+- Unnamed entities: Individuals/organizations with collective/generic references (the government, workers, officials, ministers, residents, protesters, etc.)
 - Geopolitical locations: Countries/cities when representing government statements
 
 Actor Function:
 Actor function refers to the occupation or role of the actor within a certain situation presented in the article when quoting/paraphrasing the actor.
 
 ### Extraction Steps:
-
 STEP 1: Identify all quoted and paraphrased statements with clear attribution. 
 STEP 2: After identifying quoted statements, scan the article again for verbs of saying (said, stated, argued, claimed, told, warned, etc.) to ensure indirect attributions are included. 
 STEP 3: For each statement, check the key requirements and decide if the attributed source qualifies as news actor. If yes, identify the news actor.

@@ -434,6 +434,68 @@ def extract_core_name(full_name, spacy_model: str):
     # fallback: if no entity found, return the name
     return clean_name.title()
 
+
+# Requires: pip install SPARQLWrapper requests pandas
+from SPARQLWrapper import SPARQLWrapper, JSON
+import requests
+import pandas as pd
+
+WDQS = "https://query.wikidata.org/sparql"
+HEADERS = {"User-Agent": "PartyLookup/0.1 (your-email@example.com)"}
+
+def query_sparql(sparql):
+    sparqlw = SPARQLWrapper(WDQS, agent=HEADERS["User-Agent"])
+    sparqlw.setQuery(sparql)
+    sparqlw.setReturnFormat(JSON)
+    return sparqlw.query().convert()
+
+def search_wikidata(name, language="en"):
+    params = {
+        "action": "wbsearchentities",
+        "search": name,
+        "language": language,
+        "format": "json",
+        "limit": 1
+    }
+    resp = requests.get("https://www.wikidata.org/w/api.php", params=params, headers=HEADERS)
+    resp.raise_for_status()
+    hits = resp.json().get("search", [])
+    return hits[0]["id"] if hits else None
+
+def get_latest_party_name(name, language="en"):
+    qid = search_wikidata(name, language=language)
+    if not qid:
+        return None
+    
+    sparql = f"""
+    SELECT ?partyLabel ?start ?end WHERE {{
+      VALUES ?person {{ wd:{qid} }}
+      ?person p:P102 ?stmt .
+      ?stmt ps:P102 ?party .
+      OPTIONAL {{ ?stmt pq:P580 ?start. }}
+      OPTIONAL {{ ?stmt pq:P582 ?end. }}
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+    }}
+    """
+    results = query_sparql(sparql)
+    df = pd.DataFrame([{
+        "party": r["partyLabel"]["value"],
+        "start": r.get("start", {}).get("value"),
+        "end": r.get("end", {}).get("value"),
+    } for r in results["results"]["bindings"]])
+    
+    if df.empty:
+        return None
+    
+    # order by start descending, if not null, else end descending
+    df['start'] = pd.to_datetime(df['start'], errors='coerce')
+    df['end'] = pd.to_datetime(df['end'], errors='coerce')
+    
+    df = df.sort_values(by=['start', 'end'], ascending=[False, False]).reset_index(drop=True)
+    
+    return df['party'][0]
+
+
 def main(args):
     # Validate input file exists
     if not os.path.exists(args.data_path):

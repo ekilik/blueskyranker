@@ -39,7 +39,7 @@ CSV_HEADERS = [
     "uri","cid","author_handle","author_did","indexedAt","createdAt","text",
     "reply_root_uri","reply_parent_uri","is_repost",
     "like_count","repost_count","reply_count","quote_count",
-    "news_title","news_description","news_uri","news_content", "news_actors" 
+    "news_title","news_description","news_uri","news_content"
 ]
 
 # SQLite helpers
@@ -67,8 +67,7 @@ def ensure_db(path: str) -> sqlite3.Connection:
             news_title TEXT,
             news_description TEXT,
             news_uri TEXT,
-            news_content TEXT,
-            news_actors TEXT
+            news_content TEXT
         )
         """
     )
@@ -89,7 +88,7 @@ def upsert_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
         return 0
     # Normalize embed fields: store NULL for empty strings
     def _norm(r: Dict[str, Any]) -> Dict[str, Any]:
-        for k in ("news_title", "news_description", "news_uri", "news_content", "news_actors"):
+        for k in ("news_title", "news_description", "news_uri", "news_content"):
             v = r.get(k)
             if isinstance(v, str) and v.strip() == "":
                 r[k] = None
@@ -297,193 +296,6 @@ def extract_article_content(news_uri: str) -> Optional[str]:
         logger.debug(f"Failed to extract article content from {news_uri}: {e}")
         return None
 
-def _build_prompt(system_prompt: str, main_prompt: str):
-    """Create prompts in the format expected by Ollama"""
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user", 
-            "content": main_prompt
-        }
-    ]
-    return messages
-
-def extract_actors_from_content(news_content: str, ollama_model: str = 'gpt-oss:20b') -> Optional[str]:
-    """Extract news actors from news content using Ollama."""
-    import ollama
-
-    if not news_content or len(news_content.strip()) < 50:
-        return None    
-
-    try:
-        available_models = [m.model for m in ollama.list().models]
-        if ollama_model not in available_models:
-            print(f"Pulling Ollama model: {ollama_model}")
-            ollama.pull(ollama_model)
-        
-    except Exception as e:
-        logger.debug(f"Could not check/pull model: {e}")
-
-    try:
-        # reat the prompt from file
-        prompt_file_path = os.path.join(os.path.dirname(__file__), 'actor_extraction_prompt.txt')
-        if not os.path.exists(prompt_file_path):
-            print(f"Prompt file not found: {prompt_file_path}")
-            return None
-        
-        with open(prompt_file_path, 'r', encoding='utf-8') as f:
-            prompt_content = f.read()
-
-        # Split the prompt content into system and main prompts
-        if "SYSTEM_PROMPT:" not in prompt_content or "MAIN_PROMPT:" not in prompt_content:
-            print("Prompt file is missing required sections.")
-            return None
-        
-        else:
-            parts = prompt_content.split("MAIN_PROMPT:")
-            system_prompt = parts[0].replace("SYSTEM_PROMPT:", "").strip()
-            main_prompt = parts[1].strip()
-
-        prompt = _build_prompt(system_prompt=system_prompt, main_prompt=main_prompt + "\n" + news_content)
-        # pull the model if not available
-
-        response = ollama.chat(model=ollama_model, messages=prompt, options={'temperature': 0.0, 'seed': 0})
-        response_content = response['message']['content'].strip()
-        cleaned_response = _clean_and_parse_actors(response_content)
-        
-        return cleaned_response
-
-    except Exception as e:
-        logger.debug(f"Ollama actor extraction failed: {e}")
-        return None
-
-def _clean_and_parse_actors(llm_response: str) -> Optional[str]:
-    """Clean LLM response and extract structured actor data.
-    Returns string with list of actor dictionaries, or None if parsing fails.
-    """
-    
-    try:
-        # First try to find the actors array pattern
-        # Look for "actors": [ ... ] or actors: [ ... ]
-        actors_pattern = r'"?actors"?\s*:\s*\[(.*?)\]'
-        actors_match = re.search(actors_pattern, llm_response, re.DOTALL | re.IGNORECASE)
-        
-        if not actors_match:
-            logger.debug("No actors array pattern found in LLM response")
-            return None
-        
-        actors_content = actors_match.group(1).strip()
-        if not actors_content:
-            logger.debug("Empty actors array found")
-            return None
-        
-        # Try to parse the actors content as JSON
-        try:
-            # Wrap in array brackets and try to parse
-            actors_json = f"[{actors_content}]"
-            actors_list = json.loads(actors_json)
-        except json.JSONDecodeError:
-            # If direct JSON parsing fails, try to extract individual actor objects
-            logger.debug("Direct JSON parsing failed, trying pattern extraction")
-            actors_list = _extract_actor_json_from_output(actors_content)
-        
-        if not actors_list or not isinstance(actors_list, list):
-            return None
-        
-        # Clean and validate each actor
-        cleaned_actors = []
-        for actor in actors_list:
-            if isinstance(actor, dict) and 'actor_name' in actor:
-                cleaned_actor = {
-                    'actor_name': str(actor.get('actor_name', '')).strip(),
-                    'actor_function': str(actor.get('actor_function', '')).strip(),
-                    'actor_pp': str(actor.get('actor_pp', '')).strip()
-                }
-                # Only add if actor has a name
-                if cleaned_actor['actor_name']:
-                    cleaned_actors.append(cleaned_actor)
-        
-        # Return clean JSON string
-        return json.dumps({'actors': cleaned_actors}) if cleaned_actors else None
-        
-    except Exception as e:
-        logger.debug(f"Failed to clean actor response: {e}")
-        return None
-
-
-def _extract_actor_json_from_output(actors_text: str) -> List[Dict[str, str]]:
-    """Extract actor dictionaries from text using pattern matching.
-    Fallback when JSON parsing fails.
-    """
-    import re
-    actors = []
-    
-    # Look for individual actor objects like {"actor_name": "...", "actor_function": "...", "actor_pp": "..."}
-    actor_pattern = r'\{[^}]*"?actor_name"?\s*:\s*"([^"]*)"[^}]*"?actor_function"?\s*:\s*"([^"]*)"[^}]*"?actor_pp"?\s*:\s*"([^"]*)"\s*[^}]*\}'
-    
-    matches = re.findall(actor_pattern, actors_text, re.IGNORECASE)
-    
-    for match in matches:
-        actor_name, actor_function, actor_pp = match
-        if actor_name.strip():  # Only add if has a name
-            actors.append({
-                'actor_name': actor_name.strip(),
-                'actor_function': actor_function.strip(),
-                'actor_pp': actor_pp.strip()
-            })
-    
-    # If structured pattern fails, try simpler line-by-line extraction
-    if not actors:
-        actors = _extract_actor_info_from_text(actors_text)
-    
-    return actors
-
-
-def _extract_actor_info_from_text(actors_text: str) -> List[Dict[str, str]]:
-    """Extract actors from text that might be in a simpler format.
-    Ultimate fallback for badly formatted LLM responses.
-    """
-    
-    actors = []
-    lines = actors_text.split('\n')
-    
-    current_actor = {}
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Look for key-value patterns
-        name_match = re.search(r'"?actor_name"?\s*:\s*"?([^",\n]+)"?', line, re.IGNORECASE)
-        function_match = re.search(r'"?actor_function"?\s*:\s*"?([^",\n]+)"?', line, re.IGNORECASE)
-        pp_match = re.search(r'"?actor_pp"?\s*:\s*"?([^",\n]*)"?', line, re.IGNORECASE)
-        
-        if name_match:
-            # If we have a current actor, save it
-            if current_actor.get('actor_name'):
-                actors.append(current_actor)
-            # Start new actor
-            current_actor = {
-                'actor_name': name_match.group(1).strip().strip('"'),
-                'actor_function': '',
-                'actor_pp': ''
-            }
-        
-        if function_match and current_actor:
-            current_actor['actor_function'] = function_match.group(1).strip().strip('"')
-        
-        if pp_match and current_actor:
-            current_actor['actor_pp'] = pp_match.group(1).strip().strip('"')
-    
-    # Don't forget the last actor
-    if current_actor.get('actor_name'):
-        actors.append(current_actor)
-    
-    return actors
 
 def _parse_and_normalise_created_at(created_at: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
     """Parse a source timestamp into canonical UTC string and epoch nanoseconds.
@@ -511,10 +323,7 @@ def _parse_and_normalise_created_at(created_at: Optional[str]) -> Tuple[Optional
     return iso, ns
 
 
-def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost, extract_articles: bool = False, extract_actors: bool = False, ollama_model: Optional[str] = None) -> Dict[str, Any]:    
-    # Set default model if actor extraction is enabled but no model specified
-    if extract_actors and ollama_model is None:
-        ollama_model = 'gpt-oss:20b'
+def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost, extract_articles: bool = False) -> Dict[str, Any]:    
         
     post = item.post
     record = getattr(post, "record", None)
@@ -532,10 +341,8 @@ def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost, extract_articles: bo
 
     if extract_articles and news_uri:    
         news_content = extract_article_content(news_uri)
-        news_actors = extract_actors_from_content(news_content, ollama_model) if (extract_actors and news_content) else None
     else:
         news_content = None
-        news_actors = None
 
     # Normalise createdAt and compute epoch ns
     created_iso, created_ns = _parse_and_normalise_created_at(getattr(record, "created_at", None) if record else None)
@@ -559,8 +366,7 @@ def flatten_item(item: models.AppBskyFeedDefs.FeedViewPost, extract_articles: bo
         "news_title": news_title,
         "news_description": news_description,
         "news_uri": news_uri,
-        "news_content": news_content,
-        "news_actors": news_actors
+        "news_content": news_content
     }
 
 def fetch_author_feed_all(
@@ -570,9 +376,7 @@ def fetch_author_feed_all(
     include_pins: bool,
     cutoff_dt: Optional[datetime],
     cutoff_check_every: int = 1,
-    extract_articles: bool = False, 
-    extract_actors: bool = False,
-    ollama_model: Optional[str] = None
+    extract_articles: bool = False
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch all pages for one handle, honoring cutoff_dt (createdAt >= cutoff_dt).
@@ -651,7 +455,7 @@ def fetch_author_feed_all(
 
         # Always keep in-window posts on this page
         for item in page_keep:
-            flat = flatten_item(item, extract_articles, extract_actors, ollama_model)  
+            flat = flatten_item(item, extract_articles)  
             # Track empty-string anomalies in embed fields
             if isinstance(flat.get("news_title"), str) and flat["news_title"].strip() == "":
                 embed_empty_title += 1
@@ -817,9 +621,7 @@ class Fetcher():
         include_pins=False,
         sqlite_path: Optional[str] = None,
         refresh_window: bool = False,
-        extract_articles: bool = False,
-        extract_actors: bool = False,
-        ollama_model: Optional[str] = None
+        extract_articles: bool = False
         ):
         if handles is None:
             handles = [
@@ -828,13 +630,6 @@ class Fetcher():
                 "news-flows-cz.bsky.social",
                 "news-flows-fr.bsky.social",
             ]
-        
-        # Validate parameter dependencies
-        if extract_actors and not extract_articles:
-            raise ValueError("extract_actors=True requires extract_articles=True")
-        
-        if extract_actors and ollama_model is None:
-            ollama_model = 'gpt-oss:20b'  
 
         """Fetch public Bluesky posts (SQLite only).
 
@@ -847,8 +642,6 @@ class Fetcher():
         sqlite_path (str|None): path to sqlite DB (default: ./newsflows.db)
         refresh_window (bool): If True, re-fetch the entire N-day window even if posts already exist in DB (refresh engagement metrics). If False (default), fetch incrementally from the latest saved timestamp.
         extract_articles (bool): If True, extract full article text from news URLs (default: False). This significantly slows down fetching.
-        extract_actors (bool): If True, extract actors from news articles using Ollama (requires extract_articles=True). This significantly slows down fetching.
-        ollama_model (str|None): Ollama model name for actor extraction. Only required when extract_actors=True. Defaults to 'gpt-oss:20b' when needed.
         """
 
         db_path = sqlite_path or "newsflows.db"
@@ -884,9 +677,7 @@ class Fetcher():
                 include_pins=include_pins,
                 cutoff_dt=cutoff_dt,
                 cutoff_check_every=cutoff_check_every,
-                extract_articles=extract_articles, 
-                extract_actors=extract_actors,
-                ollama_model=ollama_model  
+                extract_articles=extract_articles
             )
 
             # Upsert all rows for this handle
@@ -971,25 +762,8 @@ def main():
     help="Extract full article text from news URLs (probably will slow down fetching significantly)."
     )
 
-    parser.add_argument(
-    "--extract-actors",
-    action="store_true",
-    help="Extract actors/entities from news articles using Ollama (requires --extract-articles). Will slow down fetching significantly."
-    )
-
-    parser.add_argument(
-    "--ollama-model",
-    type=str,
-    default=None,
-    help="Ollama model to use for actor extraction (default: gpt-oss:20b when extract_actors is enabled)."
-    )
-
     parser.set_defaults(include_pins=False)
     args = parser.parse_args()
-
-    # Validate command-line argument dependencies
-    if args.extract_actors and not args.extract_articles:
-        parser.error("--extract-actors requires --extract-articles")
 
     fetcher = Fetcher(args.xrpc_base)
     results = fetcher.fetch(
@@ -999,9 +773,7 @@ def main():
     include_pins=args.include_pins,
     sqlite_path=args.sqlite_path,
     refresh_window=args.refresh_window,
-    extract_articles=args.extract_articles, 
-    extract_actors=args.extract_actors,
-    ollama_model=args.ollama_model  
+    extract_articles=args.extract_articles
     )
     print(results)
 
