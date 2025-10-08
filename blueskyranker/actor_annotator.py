@@ -244,12 +244,22 @@ class ActorAnnotator():
             time.sleep(0.5)  
         return results
     
-    def process_dataframe(self, df: pd.DataFrame, text_column: str, id_column: str) -> pd.DataFrame:
+    def process_dataframe(self, df: pd.DataFrame, text_column: str, id_column: str, title_column: str) -> pd.DataFrame:
         """
         Process a DataFrame and return it with actors column added.
         For in-memory processing without file output.
         """
-        df_result = df.copy()
+
+        df['full_text'] = (df[title_column].fillna('').astype(str) + '\n' + 
+                        df[text_column].fillna('').astype(str)) 
+        df['full_text'] = df['full_text'].str.replace(',external', ' ', regex=False)
+        df['full_text'] = df['full_text'].str.strip()
+        df['full_text'] = df['full_text'].str.replace('\n+', '\n', regex=True)
+        df['full_text'] = df['full_text'].str.replace(' +', ' ', regex=True)
+
+        # Drop unnecessary columns to save memory
+        columns_to_keep = [id_column, 'full_text']
+        df_result = df[columns_to_keep].copy()
         
         print(f"Processing {len(df_result)} articles...")
         
@@ -257,8 +267,9 @@ class ActorAnnotator():
         actors_results = []
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
             uri = row.get(id_column, idx)
-            text = row.get(text_column, '')
+            text = df_result.at[idx, 'full_text']
             print(f"Processing post ID: {uri}...")
+            print(text[:100])  # Print first 100 characters of text
             actors_json = self.extract_actors_from_content(text)
             actors_results.append(actors_json)
             
