@@ -5,6 +5,8 @@ Generate a per-handle cluster report from SQLite data.
 For each handle, loads posts from the DB, selects the top-N by engagement,
 clusters with TopicRanker (TF‑IDF / Count / SBERT), and writes a Markdown
 report with topic keywords, cluster stats, and a few example headlines.
+When `similarity_threshold` is omitted, TopicRanker defaults to 0.5 for the SBERT
+method and 0.2 for the TF‑IDF / Count variants.
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ import re
 
 import polars as pl
 
-from .fetcher import ensure_db, load_posts_df
+from .fetcher import ensure_db, load_posts_df, DEFAULT_SQLITE_PATH
 from .ranker import TopicRanker
 
 
@@ -31,12 +33,12 @@ def _simple_keywords(texts: List[str], topk: int = 8) -> List[str]:
 
 
 def generate_cluster_report(
-    db_path: str = "newsflows.db",
+    db_path: str = DEFAULT_SQLITE_PATH,
     output_path: str = "cluster_report.md",
     handles: Optional[List[str]] = None,
     method: str = "networkclustering-tfidf",
     sample_max: int = 600,
-    similarity_threshold: float = 0.2,
+    similarity_threshold: float | None = None,
     vectorizer_stopwords: Optional[str | List[str]] = None,
 ) -> str:
     """Generate cluster report Markdown and write to output_path. Returns path."""
@@ -109,11 +111,16 @@ def generate_cluster_report(
 def main():
     import argparse
     p = argparse.ArgumentParser(description="Generate per-handle cluster report from SQLite")
-    p.add_argument('--db', default='newsflows.db', help='Path to SQLite database')
+    p.add_argument('--db', default=DEFAULT_SQLITE_PATH, help='Path to SQLite database')
     p.add_argument('--output', default='cluster_report.md', help='Output Markdown path')
     p.add_argument('--method', default='networkclustering-tfidf', choices=['networkclustering-tfidf','networkclustering-count','networkclustering-sbert'])
     p.add_argument('--sample-max', type=int, default=600)
-    p.add_argument('--similarity-threshold', type=float, default=0.2)
+    p.add_argument(
+        '--similarity-threshold',
+        type=float,
+        default=None,
+        help='Override similarity cut-off; defaults to 0.5 for networkclustering-sbert, 0.2 otherwise',
+    )
     p.add_argument('--stopwords', default=None, help="'english' or comma-separated list; leave empty for None")
     p.add_argument('--handles', nargs='*', default=None, help='Optional list of handles to include')
     args = p.parse_args()
@@ -136,4 +143,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
