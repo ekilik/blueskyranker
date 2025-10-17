@@ -3,29 +3,66 @@ import json
 import csv
 import re
 import os
+import sys
+import ollama
+from ollama import Client
 import argparse
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
-import ollama
-import spacy
-
-###TODO: currently writes the annotated file, maybe not needed? 
-###TODO: hardcoded column names, wait time between model calls, minimum text length
 
 class ActorAnnotator():
-    def __init__(self, model_name: str = "gpt-oss:20b", seed: int = 0, gpu: int = 0):
+    def __init__(self, model_name: str = "gpt-oss:20b", seed: int = 0, 
+                 ollama_host: str = "http://localhost:11434", timeout: int = 120):
         self.model_name = model_name
         self.seed = seed
-        self.gpu = gpu
         self.system_prompt = None
+        self.ollama_host = ollama_host
+        self.timeout = timeout  # ADD THIS LINE
         self.main_prompt = None
         self._model_checked = False
         self._load_prompts()
+        self.client = Client(host=ollama_host, timeout=timeout)
 
         # Validate prompts were loaded successfully
         if not self.system_prompt or not self.main_prompt:
             raise ValueError("Failed to load required prompts. Check if actor_extraction_prompt.txt exists and is properly formatted.")
+
+    def _recreate_client(self):
+        """Recreate the Ollama client to prevent connection issues"""
+        try:
+            # Try to close existing client if it has a close method
+            if hasattr(self.client, 'close'):
+                self.client.close()
+        except:
+            pass
+        
+        # Delete old client
+        del self.client
+        
+        # Create new client with timeout
+        self.client = Client(host=self.ollama_host, timeout=self.timeout)  # ADD timeout parameter
+        print("Ollama client recreated")
+
+    def _restart_ollama_server(self):
+        """Restart Ollama server to clear server-side memory"""
+        import subprocess
+        print("Restarting Ollama server...")
+        try:
+            # Stop Ollama
+            subprocess.run(["pkill", "-9", "ollama"], check=False)
+            time.sleep(2)
+            
+            # Start Ollama in background
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            time.sleep(5)  
+            print("Ollama server restarted")
+        except Exception as e:
+            print(f"Failed to restart Ollama: {e}")
 
     def _load_prompts(self):
         """Load system and main prompts from file"""
@@ -83,6 +120,7 @@ class ActorAnnotator():
             print(f"Failed to ensure model availability: {type(e).__name__}: {e}")
             return False
 
+
     def build_prompt(self, system_prompt: str, main_prompt: str) -> List[Dict[str, str]]:
         """Build message format for Ollama"""
         messages = [
@@ -96,47 +134,74 @@ class ActorAnnotator():
             }
         ]
         return messages
-
-    def extract_actors_from_content(self, news_content: str, ollama_model: str = None) -> Optional[str]:
-        """Extract news actors from news content using Ollama."""
+    
+    def extract_actors_from_content(self, news_content: str, ollama_model: str = None, 
+                                   timeout_seconds: int = None) -> Tuple[str, str]:
+        """Extract raw LLM response from news content using Ollama.
+        Uses Ollama's built-in timeout, restarts client after timeout.
+        """
         if ollama_model is None:
             ollama_model = self.model_name
-            
-        if not news_content or len(news_content.strip()) < 50:
-            return json.dumps({'actors': []})    
+        
+        # Use instance timeout if not specified
+        if timeout_seconds is None:
+            timeout_seconds = self.timeout
 
+        if not news_content or len(news_content.strip()) < 50:
+            return "", "" 
         if not self.system_prompt or not self.main_prompt:
             print("Prompts not loaded properly")
-            return None
+            return "", ""  
         
-        if not self._ensure_model_available():
-            return None
-
         try:
             prompt = self.build_prompt(
                 system_prompt=self.system_prompt, 
                 main_prompt=self.main_prompt + "\n" + news_content
             )
 
-            response = ollama.chat(
+            response = self.client.chat(
                 model=ollama_model, 
                 messages=prompt, 
-                options={'temperature': 0.0, 'seed': self.seed}
+                options={
+                    'temperature': 0.0, 
+                    'seed': self.seed,
+                    'num_ctx': 6144  
+                }
             )
-            response_content = response['message']['content'].strip()
-            cleaned_response = self.clean_and_parse_actors(response_content)
             
-            return cleaned_response
+            response_content = response['message']['content'].strip()
+            if response_content:
+                cleaned_response = self.clean_and_parse_actors(response_content)
+                return response_content, cleaned_response
+            
+            # Empty response (successful call but no content)
+            return "", ""
+            
+        except TimeoutError:
+            print(f"⚠ Request timed out after {timeout_seconds}s - skipping article and restarting client")
+            self._recreate_client()
+            return "", ""
         
         except Exception as e:
-            print(f"Ollama actor extraction failed: {e}")
-            return None
+            error_msg = str(e).lower()
+            # Check if it's a connection-related error
+            if any(keyword in error_msg for keyword in ['connection', 'timeout', 'broken pipe', 'reset', 'refused']):
+                print(f"⚠ Connection error: {e} - restarting client")
+                self._recreate_client()
+            else:
+                print(f"⚠ Error during extraction: {e}")
+            return "", ""
 
     def clean_and_parse_actors(self, llm_response: str) -> Optional[str]:
         """Clean LLM response and extract structured actor data."""
+
+        cleaned = re.sub(r"\s+", " ", llm_response)
+        cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+
         try:
-            actors_pattern = r'"?actors"?\s*:\s*\[(.*?)\]'
-            actors_match = re.search(actors_pattern, llm_response, re.DOTALL | re.IGNORECASE)
+            actors_pattern = r'"?actors"?\s*:\s*\[(.*)\]'
+            actors_match = re.search(actors_pattern, cleaned, re.DOTALL | re.IGNORECASE)
             
             if not actors_match:
                 print("No actors array pattern found in LLM response")
@@ -172,7 +237,7 @@ class ActorAnnotator():
             
         except Exception as e:
             print(f"Failed to clean actor response: {e}")
-            return None
+            return json.dumps({'actors': []})
 
     def extract_actor_json_from_output(self, actors_text: str) -> List[Dict[str, str]]:
         """Extract actor dictionaries from text using pattern matching."""
@@ -231,28 +296,18 @@ class ActorAnnotator():
             actors.append(current_actor)
         
         return actors
-    
-    def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str, id_column: str) -> List[Optional[str]]:
-        """Process a batch of articles and return actor extraction results"""
-        results = []
-        for idx, row in df_batch.iterrows():
-            uri = row.get(id_column, idx)
-            text = row.get(text_column, '')
-            print(f"Processing post ID: {uri}...")
-            actors_json = self.extract_actors_from_content(text)
-            results.append(actors_json)
-            time.sleep(0.5)  
-        return results
-    
+
     def process_dataframe(self, df: pd.DataFrame, text_column: str, id_column: str, title_column: str) -> pd.DataFrame:
         """
         Process a DataFrame and return it with actors column added.
         For in-memory processing without file output.
         """
-
+        if not self._ensure_model_available():
+            print("Model not available, exiting.")
+            return df
+        
         df['full_text'] = (df[title_column].fillna('').astype(str) + '\n' + 
                         df[text_column].fillna('').astype(str)) 
-        df['full_text'] = df['full_text'].str.replace(',external', ' ', regex=False)
         df['full_text'] = df['full_text'].str.strip()
         df['full_text'] = df['full_text'].str.replace('\n+', '\n', regex=True)
         df['full_text'] = df['full_text'].str.replace(' +', ' ', regex=True)
@@ -264,83 +319,312 @@ class ActorAnnotator():
         print(f"Processing {len(df_result)} articles...")
         
         # Process each article
-        actors_results = []
+        results = []
+        cleaned_results = []
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
             uri = row.get(id_column, idx)
             text = df_result.at[idx, 'full_text']
-            print(f"Processing post ID: {uri}...")
-            print(text[:100])  # Print first 100 characters of text
-            actors_json = self.extract_actors_from_content(text)
-            actors_results.append(actors_json)
+            actors_json, cleaned_response = self.extract_actors_from_content(text)
+
+            results.append(actors_json)
+            cleaned_results.append(cleaned_response)
             
-            # Brief pause to avoid overwhelming the model
+            # Brief pause 
             time.sleep(0.5)
         
-        df_result['news_actors'] = actors_results
+        df_result['news_actors'] = results
+        df_result['raw_response'] = cleaned_results
         return df_result   
+
 
     def chunk_dataframe(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
         """Split dataframe into chunks for batch processing"""
         return [df[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
     
+    def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str, timeout: int = 120) -> Tuple[List[str], List[str]]:
+        """Process a batch of articles and return raw and cleaned results.
+        
+        Returns:
+            Tuple[List[str], List[str]]: (raw_outputs, cleaned_outputs)
+        """
+        raw_output = []
+        cleaned_output = []
+        
+        for idx, row in df_batch.iterrows():
+            text = row.get(text_column, '')
+            raw_response, cleaned_response = self.extract_actors_from_content(text, timeout_seconds=timeout)  
+            raw_output.append(raw_response)
+            cleaned_output.append(cleaned_response)
+        
+        return raw_output, cleaned_output
+
 
     def process_all_batches(self, df: pd.DataFrame, batch_size: int, 
-                        output_file_path: str, text_column: str, id_column: str) -> None:
-        """Process all batches, expand df to actor level, and save reorganized results to CSV file"""
-
+                    output_file_path: str, text_column: str, id_column: str,
+                    timeout: int = 120, start_batch: int = 0) -> None:
+        """Process all batches with memory management"""
+        import gc
+        import psutil
+        
         batches = self.chunk_dataframe(df, batch_size)
         
-        header_written = False
+        # Check if output file exists to determine if we should write header
+        header_written = os.path.exists(output_file_path)
+
+        print(f"\n{'='*60}")
+        print(f"STARTING BATCH PROCESSING")
+        print(f"{'='*60}")
+        print(f"Total articles: {len(df)}")
+        print(f"Batch size: {batch_size}")
+        print(f"Total batches: {len(batches)}")
+        print(f"Starting from batch: {start_batch + 1}")  # +1 for human-readable
+        print(f"Batches to process: {len(batches) - start_batch}")
+        print(f"{'='*60}\n")
         
-        for batch_idx, batch in enumerate(tqdm(batches, desc="Processing batches")):
-            print(f"Processing batch {batch_idx + 1}/{len(batches)} ({len(batch)} articles)")
-            
-            # Extract actors
-            batch_results = self.process_articles_batch(batch, text_column, id_column)
-            batch['news_actors'] = batch_results
-            
-            # Expand actors to individual rows
-            expanded_batch = expand_actors_to_rows(batch, id_column)
+        start_time = time.time()
         
-            expanded_batch.to_csv(
-                output_file_path, 
-                mode='a',
-                header=not header_written,
-                index=False, 
-                sep=';', 
-                quoting=csv.QUOTE_NONNUMERIC
-            )
+        # Skip to start_batch
+        for batch_idx in range(start_batch, len(batches)):
+            batch = batches[batch_idx]
+            batch_start = time.time()
+            
+            # Monitor memory usage
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            
+            print(f"\n--- Batch {batch_idx + 1}/{len(batches)} ({len(batch)} articles) ---")
+            print(f"Memory: {memory_mb:.2f} MB")
+            
+            # Recreate client every 50 batches
+            if batch_idx > 0 and batch_idx % 50 == 0:
+                print("⚙ Recreating client...")
+                self._recreate_client()
+            
+            batch = batch.reset_index(drop=True)
+            
+            # Process batch
+            batch_results, cleaned_results = self.process_articles_batch(batch, text_column, timeout=timeout)
+            
+            batch['news_actors_raw'] = batch_results
+            batch['news_actors'] = cleaned_results
+        
+            # Write results
+            with open(output_file_path, 'a', encoding='utf-8') as f:
+                batch.to_csv(
+                    f, 
+                    header=not header_written,
+                    index=False, 
+                    sep=';', 
+                    quoting=csv.QUOTE_NONNUMERIC
+                )
             header_written = True
-            print(f"Batch {batch_idx + 1} processed: {len(expanded_batch)} actor rows appended")
+            
+            batch_time = time.time() - batch_start
+            print(f"✓ Batch completed in {batch_time:.1f}s")
+            
+            # Cleanup
+            del batch
+            del batch_results
+            del cleaned_results
+            gc.collect()
         
-        print(f"All batches completed! Check {output_file_path} for final actor-level results.")
+        total_time = time.time() - start_time
+        avg_per_article = total_time / len(df) if len(df) > 0 else 0
+    
+        print(f"\n{'='*60}")
+        print(f"✓ ALL BATCHES COMPLETED!")
+        print(f"{'='*60}")
+        print(f"Total time: {total_time/60:.1f} minutes ({total_time:.1f}s)")
+        print(f"Average per article: {avg_per_article:.1f}s")
+        print(f"Total articles processed: {len(df)}")
+        print(f"Output saved to: {output_file_path}")
+        print(f"{'='*60}\n")
 
 
 def load_data(data_path: str, text_column: str, title_column: str, id_column: str) -> pd.DataFrame:
     """Load and prepare data from CSV"""
-    df = pd.read_csv(data_path, encoding='utf-8-sig', sep=';', quoting=csv.QUOTE_NONNUMERIC)
         
     # Validate required columns exist
     required_cols = [text_column, title_column, id_column]
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Required columns not found: {missing_cols}. Available: {list(df.columns)}")
-    
+    dtypes={col: str for col in required_cols}
+    df = pd.read_csv(data_path, 
+                     encoding='utf-8-sig', 
+                     sep=';', 
+                     quoting=csv.QUOTE_NONNUMERIC,
+                     usecols=required_cols,
+                    dtype=dtypes)
+
     # Create full_text column
     df['full_text'] = (df[title_column].fillna('').astype(str) + '\n' + 
                       df[text_column].fillna('').astype(str)) 
-    df['full_text'] = df['full_text'].str.replace(',external', ' ', regex=False)
     df['full_text'] = df['full_text'].str.strip()
     df['full_text'] = df['full_text'].str.replace('\n+', '\n', regex=True)
     df['full_text'] = df['full_text'].str.replace(' +', ' ', regex=True)
 
     # Drop unnecessary columns to save memory
     columns_to_keep = [id_column, 'full_text']
-    df = df[columns_to_keep].copy()
+    df = df[[id_column, 'full_text']]
         
     return df
 
-def parse_actors_json(actors_json_str):
+def _extract_json_from_text(text: str):
+    """Extract JSON structure from messy text."""
+    # Try to find object with actors key
+    obj_pattern = r'\{[^{}]*"actors"\s*:\s*\[[^\]]*\][^{}]*\}'
+    obj_match = re.search(obj_pattern, text, re.DOTALL | re.IGNORECASE)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group(0))
+        except json.JSONDecodeError:
+            pass
+    
+    # Try to find bare array of objects
+    array_pattern = r'\[\s*\{[^]]+\}\s*(?:,\s*\{[^]]+\}\s*)*\]'
+    array_match = re.search(array_pattern, text, re.DOTALL)
+    if array_match:
+        try:
+            return json.loads(array_match.group(0))
+        except json.JSONDecodeError:
+            pass
+    
+    return None
+
+def fallback_llm_output_cleaner(llm_response: str) -> Optional[str]:
+    """
+    Improved fallback parser that handles various LLM output formats.
+    Handles:
+    - Bare arrays without "actors" wrapper
+    - Many field name variations (name/actor, role/function/actor_type, party/pp)
+    - Missing "actors" key
+    - Inconsistent JSON formatting
+    - CamelCase field names (actorName, actorType, actorParty)
+    - Fields with spaces ("actor name", "name/description")
+    - Array values for single fields (actor_type: ["a"])
+    """
+    cleaned = re.sub(r"\s+", " ", llm_response)
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    
+    try:
+        # Try to parse as JSON directly
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            # If that fails, try to extract JSON structures
+            data = _extract_json_from_text(cleaned)
+        
+        if not data:
+            return None
+        
+        # Extract actors list from various formats
+        actors_list = _get_actors_from_data(data)
+        
+        if not actors_list or not isinstance(actors_list, list):
+            return None
+        
+        # Normalize each actor dictionary
+        normalized_actors = []
+        for actor in actors_list:
+            if isinstance(actor, dict):
+                norm_actor = _normalize_actor_fields(actor)
+                if norm_actor and norm_actor['actor_name'].strip():
+                    normalized_actors.append(norm_actor)
+        
+        if not normalized_actors:
+            return None
+        
+        return json.dumps({'actors': normalized_actors})
+        
+    except Exception as e:
+        print(f"Fallback parser failed: {e}")
+        return None  
+
+def _get_actors_from_data(data):
+    """Extract actors list from various data structures."""
+    # If data is already a list (bare array), return it
+    if isinstance(data, list):
+        return data
+    
+    # If data is a dict, look for actors key (case-insensitive)
+    if isinstance(data, dict):
+        for key in data.keys():
+            if key.lower() == 'actors':
+                return data[key]
+    
+    return None
+
+def _normalize_actor_fields(actor: dict) -> Optional[dict]:
+    """
+    Normalize actor dictionary to use standard field names.
+    Maps alternative field names to: actor_name, actor_function, actor_pp
+    
+    Handles variations like:
+    - actor_name, name, actor, actorName, "actor name", "name/description", actor_name/description
+    - actor_function, function, role, actor_type, actorType, category, type
+    - actor_pp, party, pp, actorParty
+    """
+    # Define field name mappings (alternatives -> standard)
+    name_variations = [
+        'actor_name', 'name', 'actor', 'actorName', 
+        'actor name', 'name/description', 'actor_name/description'
+    ]
+    function_variations = [
+        'actor_function', 'function', 'role', 'actor_type', 
+        'actorType', 'category', 'type', 'actor_function', 'actor_type (function)',
+        'actor_f'
+    ]
+    party_variations = [
+        'actor_pp', 'party', 'pp', 'actorParty'
+    ]
+    
+    # Extract actor_name (required)
+    actor_name = None
+    for field in name_variations:
+        if field in actor:
+            value = actor[field]
+            # Handle array values (take first element)
+            if isinstance(value, list):
+                value = value[0] if value else None
+            if value and value is not None:
+                actor_name = str(value).strip()
+                if actor_name:
+                    break
+    
+    if not actor_name:
+        return None
+    
+    # Extract actor_function (optional)
+    actor_function = ''
+    for field in function_variations:
+        if field in actor:
+            value = actor[field]
+            # Handle array values (take first element or join)
+            if isinstance(value, list):
+                value = value[0] if value else ''
+            if value and value is not None:
+                actor_function = str(value).strip()
+                break
+    
+    # Extract actor_pp (optional)
+    actor_pp = ''
+    for field in party_variations:
+        if field in actor:
+            value = actor[field]
+            # Handle array values
+            if isinstance(value, list):
+                value = value[0] if value else ''
+            # Skip null/None values
+            if value is not None and value != 'null':
+                actor_pp = str(value).strip()
+                break
+    
+    return {
+        'actor_name': actor_name,
+        'actor_function': actor_function,
+        'actor_pp': actor_pp
+    }
+
+def _parse_actors_json(actors_json_str):
     """Parse the JSON string and extract actor lists"""
     if pd.isna(actors_json_str):
         return [], [], []
@@ -374,7 +658,8 @@ def expand_actors_to_rows(df, id_column: str):
         """Generator that yields actor rows one at a time"""
         for idx, row in df.iterrows():
             # Parse actors for this row
-            names, functions, parties = parse_actors_json(row['news_actors'])
+            names, functions, parties = _parse_actors_json(row['news_actors'])
+            raw_output = row.get('news_actors_raw', '')
             
             # If no actors found, create one row with missing values
             if len(names) == 0:
@@ -382,85 +667,72 @@ def expand_actors_to_rows(df, id_column: str):
                     id_column: row[id_column],
                     'actor_name': '',
                     'actor_function': '',
-                    'actor_pp': ''
+                    'actor_pp': '',
+                    'news_actors_raw': raw_output
                 }
             else:
-                # Yield each actor as a separate row
+                # each actor as a separate row
                 for i in range(len(names)):
                     yield {
                         id_column: row[id_column],
                         'actor_name': names[i] if i < len(names) else '',
                         'actor_function': functions[i] if i < len(functions) else '',
-                        'actor_pp': parties[i] if i < len(parties) else ''
+                        'actor_pp': parties[i] if i < len(parties) else '',
+                        'news_actors_raw': raw_output
                     }
-    
-    # Create DataFrame from generator (more memory efficient)
+            
     return pd.DataFrame(generate_actor_rows())
 
-def clean_actor_name(name):
+
+def _clean_actor_name(name):
     # Remove text in parentheses
     return re.sub(r"\(.*?\)", "", name).strip()
- 
-def extract_core_name(full_name, spacy_model: str):
+
+def extract_core_name(full_name, nlp):
     """
-    Use NER to decide if this is a PERSON or ORG/GPE.
     - For PERSON: return the detected person name
-    - For ORG/GPE: return cleaned organization name
-    - Otherwise: return None (generic actor)
+    - Otherwise: return None 
     """
+
     if pd.isna(full_name) or not full_name.strip():
         return None
         
-    clean_name = clean_actor_name(full_name)
-    
-    # Try to load the model, download if not available
-    try:
-        nlp = spacy.load(spacy_model)
-    except OSError:
-        print(f"spaCy model '{spacy_model}' not found. Downloading...")
-        try:
-            import subprocess
-            # Use subprocess instead of spacy.cli
-            subprocess.run([
-                "python", "-m", "spacy", "download", spacy_model
-            ], check=True)
-            print(f"Successfully downloaded '{spacy_model}'")
-            # Load the model after download
-            nlp = spacy.load(spacy_model)
-        except Exception as e:
-            print(f"Failed to download spaCy model '{spacy_model}': {e}")
-            print("Please install manually")
-            return None
-    except Exception as e:
-        print(f"Error loading spaCy model: {e}")
-        return None
-    
-    doc = nlp(clean_name)
+    clean_name = _clean_actor_name(full_name)
 
-    # Look for named entities
-    for ent in doc.ents:
-        if ent.label_ in ["PERSON", "ORG", "GPE"]:
-            return ent.text.title()
-    
-    # fallback: if no entity found, return the name
-    return clean_name.title()
+    doc = nlp(clean_name)
+    # Get unique entity names only
+    person_entities = list({ent.text for ent in doc.ents if ent.type in ['PER']})
+
+    # unlist the names
+    entity_str = person_entities[0] if person_entities else None
+    entity_str = entity_str.strip() if entity_str else None
+    entity_str = entity_str.title() if entity_str else None
+
+    return entity_str
 
 
 # Requires: pip install SPARQLWrapper requests pandas
-from SPARQLWrapper import SPARQLWrapper, JSON
-import requests
-import pandas as pd
-
 WDQS = "https://query.wikidata.org/sparql"
 HEADERS = {"User-Agent": "PartyLookup/0.1 (your-email@example.com)"}
 
-def query_sparql(sparql):
+def _query_sparql(sparql):
+    try:
+        from SPARQLWrapper import SPARQLWrapper, JSON
+    except Exception as e:
+        raise RuntimeError("SPARQLWrapper not installed. Install with: pip install SPARQLWrapper") from e
+    
     sparqlw = SPARQLWrapper(WDQS, agent=HEADERS["User-Agent"])
     sparqlw.setQuery(sparql)
     sparqlw.setReturnFormat(JSON)
+    
     return sparqlw.query().convert()
 
-def search_wikidata(name, language="en"):
+def _search_wikidata(name, language="en"):
+    try:
+        import requests
+    except Exception as e:
+        raise RuntimeError("requests not installed. Install with: pip install requests") from e
+
     params = {
         "action": "wbsearchentities",
         "search": name,
@@ -474,7 +746,7 @@ def search_wikidata(name, language="en"):
     return hits[0]["id"] if hits else None
 
 def get_latest_party_name(name, language="en"):
-    qid = search_wikidata(name, language=language)
+    qid = _search_wikidata(name, language=language)
     if not qid:
         return None
     
@@ -488,7 +760,7 @@ def get_latest_party_name(name, language="en"):
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
     }}
     """
-    results = query_sparql(sparql)
+    results = _query_sparql(sparql)
     df = pd.DataFrame([{
         "party": r["partyLabel"]["value"],
         "start": r.get("start", {}).get("value"),
@@ -517,8 +789,12 @@ def main(args):
     annotator = ActorAnnotator(
         model_name=args.model_name,
         seed=args.seed,
-        gpu=args.gpu
     )
+
+    # Ensure model is available
+    if not annotator._ensure_model_available():
+        print("Model not available, exiting.")
+        return
     
     # Load data with explicit arguments
     try:
@@ -540,8 +816,10 @@ def main(args):
         df=df,
         batch_size=args.batch_size,
         output_file_path=args.output_file_path,
-        text_column='full_text',  # We know this is created in load_data()
-        id_column=args.id_column
+        text_column='full_text',  
+        id_column=args.id_column,
+        timeout=args.timeout,
+        start_batch=args.start_batch  
     )
 
 if __name__ == "__main__":
@@ -556,7 +834,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=10, help="Number of articles to process per batch")
     parser.add_argument('--model_name', type=str, default='gpt-oss:20b', help="Ollama model name")
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility")
-    parser.add_argument('--gpu', type=int, default=0, help="GPU index to use")
+    parser.add_argument('--timeout', type=int, default=120, help="Timeout in seconds per article (default: 120)")
+    parser.add_argument('--start_batch', type=int, default=0, help="Batch number to start from (0-indexed)")
 
     args = parser.parse_args()
     main(args)
