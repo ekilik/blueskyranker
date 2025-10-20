@@ -149,6 +149,7 @@ class ActorAnnotator():
 
         if not news_content or len(news_content.strip()) < 50:
             return "", "" 
+        
         if not self.system_prompt or not self.main_prompt:
             print("Prompts not loaded properly")
             return "", ""  
@@ -237,7 +238,13 @@ class ActorAnnotator():
             
         except Exception as e:
             print(f"Failed to clean actor response: {e}")
-            return json.dumps({'actors': []})
+            try: 
+                fallback_result = fallback_llm_output_cleaner(llm_response)
+                if fallback_result:
+                    return fallback_result
+            except Exception as fe:
+                print(f"Fallback parser also failed: {fe}")
+                return None
 
     def extract_actor_json_from_output(self, actors_text: str) -> List[Dict[str, str]]:
         """Extract actor dictionaries from text using pattern matching."""
@@ -626,10 +633,13 @@ def _normalize_actor_fields(actor: dict) -> Optional[dict]:
 
 def _parse_actors_json(actors_json_str):
     """Parse the JSON string and extract actor lists"""
-    if pd.isna(actors_json_str):
+    cleaned = re.sub(r"\s+", " ", actors_json_str)
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if pd.isna(cleaned):
         return [], [], []
     try:
-        data = json.loads(actors_json_str)
+        data = json.loads(cleaned)
         actors = data.get('actors', [])
         
         names = [actor.get('actor_name', '') for actor in actors]
