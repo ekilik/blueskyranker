@@ -11,7 +11,7 @@ import time
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 
-class ActorAnnotator():
+class ActorAnnotator:
     def __init__(self, model_name: str = "gpt-oss:20b", seed: int = 0, 
                  ollama_host: str = "http://localhost:11434", timeout: int = 120):
         self.model_name = model_name
@@ -49,11 +49,11 @@ class ActorAnnotator():
         import subprocess
         print("Restarting Ollama server...")
         try:
-            # Stop Ollama
+            # First stop Ollama
             subprocess.run(["pkill", "-9", "ollama"], check=False)
             time.sleep(2)
             
-            # Start Ollama in background
+            # Re-start Ollama in background
             subprocess.Popen(
                 ["ollama", "serve"],
                 stdout=subprocess.DEVNULL,
@@ -95,13 +95,13 @@ class ActorAnnotator():
             print(f"Checking availability of model: {self.model_name}")
             models_response = ollama.list()
             
-            # Extract model names from the ListResponse object
             model_names = []
             if hasattr(models_response, 'models'):
                 for model in models_response.models:
                     if hasattr(model, 'model'):
                         model_names.append(model.model)
             
+            # Pull model if not found
             if self.model_name not in model_names:
                 print(f"Model {self.model_name} not found. Pulling model...")
                 print("This may take several minutes for large models.")
@@ -139,6 +139,8 @@ class ActorAnnotator():
                                    timeout_seconds: int = None) -> Tuple[str, str]:
         """Extract raw LLM response from news content using Ollama.
         Uses Ollama's built-in timeout, restarts client after timeout.
+        Has a pre-set num_ctx value to handle longer articles, can be adapted if needed.
+        Timeout is handled at the client level. 120 seconds suffice.
         """
         if ollama_model is None:
             ollama_model = self.model_name
@@ -171,6 +173,7 @@ class ActorAnnotator():
             )
             
             response_content = response['message']['content'].strip()
+            
             if response_content:
                 cleaned_response = self.clean_and_parse_actors(response_content)
                 return response_content, cleaned_response
@@ -179,7 +182,7 @@ class ActorAnnotator():
             return "", ""
             
         except TimeoutError:
-            print(f"⚠ Request timed out after {timeout_seconds}s - skipping article and restarting client")
+            print(f"Request timed out after {timeout_seconds}s - skipping article and restarting client")
             self._recreate_client()
             return "", ""
         
@@ -187,10 +190,10 @@ class ActorAnnotator():
             error_msg = str(e).lower()
             # Check if it's a connection-related error
             if any(keyword in error_msg for keyword in ['connection', 'timeout', 'broken pipe', 'reset', 'refused']):
-                print(f"⚠ Connection error: {e} - restarting client")
+                print(f"Connection error: {e} - restarting client")
                 self._recreate_client()
             else:
-                print(f"⚠ Error during extraction: {e}")
+                print(f"Error during extraction: {e}")
             return "", ""
 
     def clean_and_parse_actors(self, llm_response: str) -> Optional[str]:
@@ -218,11 +221,29 @@ class ActorAnnotator():
                 actors_list = json.loads(actors_json)
             except json.JSONDecodeError:
                 print("Direct JSON parsing failed, trying pattern extraction")
-                actors_list = self.extract_actor_json_from_output(actors_content)
+                actors_list = self._extract_actor_json_from_output(actors_content)
             
-            if not actors_list or not isinstance(actors_list, list):
-                return None
-            
+            if actors_list:
+                # Check if actors use standard field names
+                has_standard_fields = any(
+                    'actor_name' in actor 
+                    for actor in actors_list 
+                    if isinstance(actor, dict)
+                )
+                
+                # Check if actors use alternative field names
+                alternative_field_names = ['name', 'actor', 'role', 'function', 'type', 'party']
+                has_alternative_fields = any(
+                    any(field in actor for field in alternative_field_names)
+                    for actor in actors_list 
+                    if isinstance(actor, dict)
+                )
+                
+                # If no standard fields but has alternatives, it's a field name issue
+                if not has_standard_fields and has_alternative_fields:
+                    print("Actors use alternative field names - trying fallback")
+                    return self._fallback_clean_and_parse_actors(llm_response)
+                
             cleaned_actors = []
             for actor in actors_list:
                 if isinstance(actor, dict) and 'actor_name' in actor:
@@ -234,19 +255,183 @@ class ActorAnnotator():
                     if cleaned_actor['actor_name']:
                         cleaned_actors.append(cleaned_actor)
             
-            return json.dumps({'actors': cleaned_actors}) if cleaned_actors else None
+            # No Fallback Trigger 3 - empty after filtering is legitimate
+            if not cleaned_actors:
+                print("No valid actors after filtering (legitimate empty)")
+                return None
+            
+            return json.dumps({'actors': cleaned_actors})
             
         except Exception as e:
-            print(f"Failed to clean actor response: {e}")
-            try: 
-                fallback_result = fallback_llm_output_cleaner(llm_response)
-                if fallback_result:
-                    return fallback_result
-            except Exception as fe:
-                print(f"Fallback parser also failed: {fe}")
+            print(f"Unexpected exception during parsing: {e}")
+            if len(llm_response.strip()) > 20:  # Has substantial content
+                print("Trying fallback due to exception")
+                try: 
+                    fallback_result = self._fallback_clean_and_parse_actors(llm_response)
+                    if fallback_result:
+                        return fallback_result
+                except Exception as fe:
+                    print(f"Fallback parser also failed: {fe}")
+            return None
+            
+    def _fallback_llm_output_cleaner(self, llm_response: str) -> Optional[str]:
+        """
+        Improved fallback parser that handles various LLM output formats.
+        Handles:
+        - Bare arrays without "actors" wrapper
+        - Many field name variations (name/actor, role/function/actor_type, party/pp)
+        - Missing "actors" key
+        - Inconsistent JSON formatting
+        - CamelCase field names (actorName, actorType, actorParty)
+        - Fields with spaces ("actor name", "name/description")
+        - Array values for single fields (actor_type: ["a"])
+        """
+        cleaned = re.sub(r"\s+", " ", llm_response)
+        cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        
+        try:
+            # Try to parse as JSON directly
+            try:
+                data = json.loads(cleaned)
+            except json.JSONDecodeError:
+                # If that fails, try to extract JSON structures
+                data = self._extract_json_from_text(cleaned)
+            
+            if not data:
                 return None
+            
+            # Extract actors list from various formats
+            actors_list = self._get_actors_from_data(data)
+            
+            if not actors_list or not isinstance(actors_list, list):
+                return None
+            
+            # Normalize each actor dictionary
+            normalized_actors = []
+            for actor in actors_list:
+                if isinstance(actor, dict):
+                    norm_actor = self._normalize_actor_fields(actor)
+                    if norm_actor and norm_actor['actor_name'].strip():
+                        normalized_actors.append(norm_actor)
+            
+            if not normalized_actors:
+                return None
+            
+            return json.dumps({'actors': normalized_actors})
+            
+        except Exception as e:
+            print(f"Fallback parser failed: {e}")
+            return None  
+        
+    def _extract_json_from_text(self, text: str):
+        """Extract JSON structure from messy text."""
+        # Try to find object with actors key
+        obj_pattern = r'\{[^{}]*"actors"\s*:\s*\[[^\]]*\][^{}]*\}'
+        obj_match = re.search(obj_pattern, text, re.DOTALL | re.IGNORECASE)
+        if obj_match:
+            try:
+                return json.loads(obj_match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        # Try to find bare array of objects
+        array_pattern = r'\[\s*\{[^]]+\}\s*(?:,\s*\{[^]]+\}\s*)*\]'
+        array_match = re.search(array_pattern, text, re.DOTALL)
+        if array_match:
+            try:
+                return json.loads(array_match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        return None
 
-    def extract_actor_json_from_output(self, actors_text: str) -> List[Dict[str, str]]:
+    def _get_actors_from_data(self, data):
+        """Extract actors list from various data structures."""
+        # If data is already a list (bare array), return it
+        if isinstance(data, list):
+            return data
+        
+        # If data is a dict, look for actors key (case-insensitive)
+        if isinstance(data, dict):
+            for key in data.keys():
+                if key.lower() == 'actors':
+                    return data[key]
+        
+        return None
+
+    def _normalize_actor_fields(self, actor: dict) -> Optional[dict]:
+        """
+        Normalize actor dictionary to use standard field names.
+        Maps alternative field names to: actor_name, actor_function, actor_pp
+        
+        Handles variations like:
+        - actor_name, name, actor, actorName, "actor name", "name/description", actor_name/description
+        - actor_function, function, role, actor_type, actorType, category, type
+        - actor_pp, party, pp, actorParty
+        """
+        # Define field name mappings (alternatives -> standard)
+        name_variations = [
+            'actor_name', 'name', 'actor', 'actorName', 
+            'actor name', 'name/description', 'actor_name/description'
+        ]
+        function_variations = [
+            'actor_function', 'function', 'role', 'actor_type', 
+            'actorType', 'category', 'type', 'actor_function', 'actor_type (function)',
+            'actor_f'
+        ]
+        party_variations = [
+            'actor_pp', 'party', 'pp', 'actorParty'
+        ]
+        
+        # Extract actor_name (required)
+        actor_name = None
+        for field in name_variations:
+            if field in actor:
+                value = actor[field]
+                # Handle array values (take first element)
+                if isinstance(value, list):
+                    value = value[0] if value else None
+                if value and value is not None:
+                    actor_name = str(value).strip()
+                    if actor_name:
+                        break
+        
+        if not actor_name:
+            return None
+        
+        # Extract actor_function (optional)
+        actor_function = ''
+        for field in function_variations:
+            if field in actor:
+                value = actor[field]
+                # Handle array values (take first element or join)
+                if isinstance(value, list):
+                    value = value[0] if value else ''
+                if value and value is not None:
+                    actor_function = str(value).strip()
+                    break
+        
+        # Extract actor_pp (optional)
+        actor_pp = ''
+        for field in party_variations:
+            if field in actor:
+                value = actor[field]
+                # Handle array values
+                if isinstance(value, list):
+                    value = value[0] if value else ''
+                # Skip null/None values
+                if value is not None and value != 'null':
+                    actor_pp = str(value).strip()
+                    break
+        
+        return {
+            'actor_name': actor_name,
+            'actor_function': actor_function,
+            'actor_pp': actor_pp
+        }
+
+    def _extract_actor_json_from_output(self, actors_text: str) -> List[Dict[str, str]]:
         """Extract actor dictionaries from text using pattern matching."""
         actors = []
         
@@ -264,11 +449,11 @@ class ActorAnnotator():
                 })
         
         if not actors:
-            actors = self.extract_actor_info_from_text(actors_text)
+            actors = self._extract_actor_info_from_text(actors_text)
         
         return actors
 
-    def extract_actor_info_from_text(self, actors_text: str) -> List[Dict[str, str]]:
+    def _extract_actor_info_from_text(self, actors_text: str) -> List[Dict[str, str]]:
         """Extract actors from text that might be in a simpler format."""
         actors = []
         lines = actors_text.split('\n')
@@ -304,7 +489,12 @@ class ActorAnnotator():
         
         return actors
 
-    def process_dataframe(self, df: pd.DataFrame, text_column: str, id_column: str, title_column: str) -> pd.DataFrame:
+    def process_dataframe(self, 
+                          df: pd.DataFrame, 
+                          text_column: str, 
+                          id_column: str, 
+                          title_column: str,
+                          timeout_seconds: int) -> pd.DataFrame:
         """
         Process a DataFrame and return it with actors column added.
         For in-memory processing without file output.
@@ -331,13 +521,13 @@ class ActorAnnotator():
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
             uri = row.get(id_column, idx)
             text = df_result.at[idx, 'full_text']
-            actors_json, cleaned_response = self.extract_actors_from_content(text)
+            actors_json, cleaned_response = self.extract_actors_from_content(text, timeout_seconds=timeout_seconds)
 
             results.append(actors_json)
             cleaned_results.append(cleaned_response)
             
             # Brief pause 
-            time.sleep(0.5)
+            time.sleep(0.1)
         
         df_result['news_actors'] = results
         df_result['raw_response'] = cleaned_results
@@ -473,321 +663,6 @@ def load_data(data_path: str, text_column: str, title_column: str, id_column: st
     df = df[[id_column, 'full_text']]
         
     return df
-
-def _extract_json_from_text(text: str):
-    """Extract JSON structure from messy text."""
-    # Try to find object with actors key
-    obj_pattern = r'\{[^{}]*"actors"\s*:\s*\[[^\]]*\][^{}]*\}'
-    obj_match = re.search(obj_pattern, text, re.DOTALL | re.IGNORECASE)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group(0))
-        except json.JSONDecodeError:
-            pass
-    
-    # Try to find bare array of objects
-    array_pattern = r'\[\s*\{[^]]+\}\s*(?:,\s*\{[^]]+\}\s*)*\]'
-    array_match = re.search(array_pattern, text, re.DOTALL)
-    if array_match:
-        try:
-            return json.loads(array_match.group(0))
-        except json.JSONDecodeError:
-            pass
-    
-    return None
-
-def fallback_llm_output_cleaner(llm_response: str) -> Optional[str]:
-    """
-    Improved fallback parser that handles various LLM output formats.
-    Handles:
-    - Bare arrays without "actors" wrapper
-    - Many field name variations (name/actor, role/function/actor_type, party/pp)
-    - Missing "actors" key
-    - Inconsistent JSON formatting
-    - CamelCase field names (actorName, actorType, actorParty)
-    - Fields with spaces ("actor name", "name/description")
-    - Array values for single fields (actor_type: ["a"])
-    """
-    cleaned = re.sub(r"\s+", " ", llm_response)
-    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    
-    try:
-        # Try to parse as JSON directly
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            # If that fails, try to extract JSON structures
-            data = _extract_json_from_text(cleaned)
-        
-        if not data:
-            return None
-        
-        # Extract actors list from various formats
-        actors_list = _get_actors_from_data(data)
-        
-        if not actors_list or not isinstance(actors_list, list):
-            return None
-        
-        # Normalize each actor dictionary
-        normalized_actors = []
-        for actor in actors_list:
-            if isinstance(actor, dict):
-                norm_actor = _normalize_actor_fields(actor)
-                if norm_actor and norm_actor['actor_name'].strip():
-                    normalized_actors.append(norm_actor)
-        
-        if not normalized_actors:
-            return None
-        
-        return json.dumps({'actors': normalized_actors})
-        
-    except Exception as e:
-        print(f"Fallback parser failed: {e}")
-        return None  
-
-def _get_actors_from_data(data):
-    """Extract actors list from various data structures."""
-    # If data is already a list (bare array), return it
-    if isinstance(data, list):
-        return data
-    
-    # If data is a dict, look for actors key (case-insensitive)
-    if isinstance(data, dict):
-        for key in data.keys():
-            if key.lower() == 'actors':
-                return data[key]
-    
-    return None
-
-def _normalize_actor_fields(actor: dict) -> Optional[dict]:
-    """
-    Normalize actor dictionary to use standard field names.
-    Maps alternative field names to: actor_name, actor_function, actor_pp
-    
-    Handles variations like:
-    - actor_name, name, actor, actorName, "actor name", "name/description", actor_name/description
-    - actor_function, function, role, actor_type, actorType, category, type
-    - actor_pp, party, pp, actorParty
-    """
-    # Define field name mappings (alternatives -> standard)
-    name_variations = [
-        'actor_name', 'name', 'actor', 'actorName', 
-        'actor name', 'name/description', 'actor_name/description'
-    ]
-    function_variations = [
-        'actor_function', 'function', 'role', 'actor_type', 
-        'actorType', 'category', 'type', 'actor_function', 'actor_type (function)',
-        'actor_f'
-    ]
-    party_variations = [
-        'actor_pp', 'party', 'pp', 'actorParty'
-    ]
-    
-    # Extract actor_name (required)
-    actor_name = None
-    for field in name_variations:
-        if field in actor:
-            value = actor[field]
-            # Handle array values (take first element)
-            if isinstance(value, list):
-                value = value[0] if value else None
-            if value and value is not None:
-                actor_name = str(value).strip()
-                if actor_name:
-                    break
-    
-    if not actor_name:
-        return None
-    
-    # Extract actor_function (optional)
-    actor_function = ''
-    for field in function_variations:
-        if field in actor:
-            value = actor[field]
-            # Handle array values (take first element or join)
-            if isinstance(value, list):
-                value = value[0] if value else ''
-            if value and value is not None:
-                actor_function = str(value).strip()
-                break
-    
-    # Extract actor_pp (optional)
-    actor_pp = ''
-    for field in party_variations:
-        if field in actor:
-            value = actor[field]
-            # Handle array values
-            if isinstance(value, list):
-                value = value[0] if value else ''
-            # Skip null/None values
-            if value is not None and value != 'null':
-                actor_pp = str(value).strip()
-                break
-    
-    return {
-        'actor_name': actor_name,
-        'actor_function': actor_function,
-        'actor_pp': actor_pp
-    }
-
-def _parse_actors_json(actors_json_str):
-    """Parse the JSON string and extract actor lists"""
-    cleaned = re.sub(r"\s+", " ", actors_json_str)
-    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    if pd.isna(cleaned):
-        return [], [], []
-    try:
-        data = json.loads(cleaned)
-        actors = data.get('actors', [])
-        
-        names = [actor.get('actor_name', '') for actor in actors]
-        functions = [actor.get('actor_function', '') for actor in actors] 
-        parties = [actor.get('actor_pp', '') for actor in actors]
-        
-        return names, functions, parties
-    except (json.JSONDecodeError, AttributeError):
-        return [], [], []
-    
-def expand_actors_to_rows(df, id_column: str):
-    """
-    Transform DataFrame from article-level to actor-level.
-    Each actor becomes a separate row with article metadata.
-    Memory-efficient version using generator and chunked processing.
-    Articles without actors get a row with missing values in actor columns.
-    """
-    if df.empty:
-        return pd.DataFrame()
-    
-    # Validate that the ID column exists
-    if id_column not in df.columns:
-        raise ValueError(f"ID column '{id_column}' not found in DataFrame. Available columns: {list(df.columns)}")
-    
-    def generate_actor_rows():
-        """Generator that yields actor rows one at a time"""
-        for idx, row in df.iterrows():
-            # Parse actors for this row
-            names, functions, parties = _parse_actors_json(row['news_actors'])
-            raw_output = row.get('news_actors_raw', '')
-            
-            # If no actors found, create one row with missing values
-            if len(names) == 0:
-                yield {
-                    id_column: row[id_column],
-                    'actor_name': '',
-                    'actor_function': '',
-                    'actor_pp': '',
-                    'news_actors_raw': raw_output
-                }
-            else:
-                # each actor as a separate row
-                for i in range(len(names)):
-                    yield {
-                        id_column: row[id_column],
-                        'actor_name': names[i] if i < len(names) else '',
-                        'actor_function': functions[i] if i < len(functions) else '',
-                        'actor_pp': parties[i] if i < len(parties) else '',
-                        'news_actors_raw': raw_output
-                    }
-            
-    return pd.DataFrame(generate_actor_rows())
-
-
-def _clean_actor_name(name):
-    # Remove text in parentheses
-    return re.sub(r"\(.*?\)", "", name).strip()
-
-def extract_core_name(full_name, nlp):
-    """
-    - For PERSON: return the detected person name
-    - Otherwise: return None 
-    """
-
-    if pd.isna(full_name) or not full_name.strip():
-        return None
-        
-    clean_name = _clean_actor_name(full_name)
-
-    doc = nlp(clean_name)
-    # Get unique entity names only
-    person_entities = list({ent.text for ent in doc.ents if ent.type in ['PER']})
-
-    # unlist the names
-    entity_str = person_entities[0] if person_entities else None
-    entity_str = entity_str.strip() if entity_str else None
-    entity_str = entity_str.title() if entity_str else None
-
-    return entity_str
-
-
-# Requires: pip install SPARQLWrapper requests pandas
-WDQS = "https://query.wikidata.org/sparql"
-HEADERS = {"User-Agent": "PartyLookup/0.1 (your-email@example.com)"}
-
-def _query_sparql(sparql):
-    try:
-        from SPARQLWrapper import SPARQLWrapper, JSON
-    except Exception as e:
-        raise RuntimeError("SPARQLWrapper not installed. Install with: pip install SPARQLWrapper") from e
-    
-    sparqlw = SPARQLWrapper(WDQS, agent=HEADERS["User-Agent"])
-    sparqlw.setQuery(sparql)
-    sparqlw.setReturnFormat(JSON)
-    
-    return sparqlw.query().convert()
-
-def _search_wikidata(name, language="en"):
-    try:
-        import requests
-    except Exception as e:
-        raise RuntimeError("requests not installed. Install with: pip install requests") from e
-
-    params = {
-        "action": "wbsearchentities",
-        "search": name,
-        "language": language,
-        "format": "json",
-        "limit": 1
-    }
-    resp = requests.get("https://www.wikidata.org/w/api.php", params=params, headers=HEADERS)
-    resp.raise_for_status()
-    hits = resp.json().get("search", [])
-    return hits[0]["id"] if hits else None
-
-def get_latest_party_name(name, language="en"):
-    qid = _search_wikidata(name, language=language)
-    if not qid:
-        return None
-    
-    sparql = f"""
-    SELECT ?partyLabel ?start ?end WHERE {{
-      VALUES ?person {{ wd:{qid} }}
-      ?person p:P102 ?stmt .
-      ?stmt ps:P102 ?party .
-      OPTIONAL {{ ?stmt pq:P580 ?start. }}
-      OPTIONAL {{ ?stmt pq:P582 ?end. }}
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    """
-    results = _query_sparql(sparql)
-    df = pd.DataFrame([{
-        "party": r["partyLabel"]["value"],
-        "start": r.get("start", {}).get("value"),
-        "end": r.get("end", {}).get("value"),
-    } for r in results["results"]["bindings"]])
-    
-    if df.empty:
-        return None
-    
-    # order by start descending, if not null, else end descending
-    df['start'] = pd.to_datetime(df['start'], errors='coerce')
-    df['end'] = pd.to_datetime(df['end'], errors='coerce')
-    
-    df = df.sort_values(by=['start', 'end'], ascending=[False, False]).reset_index(drop=True)
-    
-    return df['party'][0]
-
 
 def main(args):
     # Validate input file exists
