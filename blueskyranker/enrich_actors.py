@@ -25,8 +25,7 @@ class ActorEnricher:
             actor_df: Optional[pd.DataFrame] = None, 
             id_column: str = 'news_id', 
             language: str = 'en',
-            party_reference_path: Optional[str] = None,
-            ideology_reference_path: Optional[str] = None):
+            political_data_path: Optional[str] = None):
         
         """
         Initialize ActorEnricher.
@@ -36,8 +35,7 @@ class ActorEnricher:
             actor_df: DataFrame with actor annotations (alternative to path if path not provided)
             id_column: Name of the column containing unique article identifiers
             language: Language for NER processing ('en', 'nl', etc.)
-            party_reference_path: Path to CSV with party reference data (columns: person_name, party_short, party_name)
-            ideology_reference_path: Path to CSV with party ideology scores (columns: party, lrgen, lrecon, galtan)
+            political_data_path: Path to CSV with party reference data (columns: person_name, party_name_short, party_name)
         """
 
         self.actor_data_path = actor_data_path
@@ -56,8 +54,9 @@ class ActorEnricher:
         )
 
         # Load reference data
-        self.party_reference_df = self._load_party_reference(party_reference_path)
-        self.ideology_reference_df = self._load_ideology_reference(ideology_reference_path)
+        self.political_df = self._load_political_data(political_data_path)
+        self.party_reference_df = self.political_df[['politician_name', 'party_name_short', 'party_name']].drop_duplicates() if self.political_df is not None else None
+        self.ideology_reference_df = self.political_df[['party_name_short', 'lrgen', 'lrecon', 'galtan']].drop_duplicates() if self.political_df is not None else None
 
 
     def _load_actor_data(self) -> pd.DataFrame:
@@ -71,21 +70,18 @@ class ActorEnricher:
             else:
                 raise ValueError("No actor data path provided and no DataFrame was passed.")
             
-    def _load_party_reference(self, path: Optional[str]) -> Optional[pd.DataFrame]:
+    def _load_political_data(self, path: Optional[str]) -> Optional[pd.DataFrame]:
         """Load party reference data for matching."""
         if path and os.path.exists(path):
             print(f"Loading party reference data from {path}")
             return pd.read_csv(path, sep=';', quoting=csv.QUOTE_NONNUMERIC)
         return None
-    
-    def _load_ideology_reference(self, path: Optional[str]) -> Optional[pd.DataFrame]:
-        """Load party ideology scores."""
-        if path and os.path.exists(path):
-            print(f"Loading ideology reference data from {path}")
-            return pd.read_csv(path, sep=';', quoting=csv.QUOTE_NONNUMERIC)
-        return None
+
     
     def _parse_actors_json(self, actors_json_str):
+        if pd.isna(actors_json_str):
+            return [], [], []
+        
         """Parse the JSON string and extract actor lists"""
         cleaned = re.sub(r"\s+", " ", actors_json_str)
         cleaned = re.sub(r"^```(?:json)?|```$", "", 
@@ -93,8 +89,7 @@ class ActorEnricher:
                          flags=re.IGNORECASE | re.MULTILINE
                          ).strip()
         cleaned = re.sub(r"\s+", " ", cleaned)
-        if pd.isna(cleaned):
-            return [], [], []
+
         try:
             data = json.loads(cleaned)
             actors = data.get('actors', [])
@@ -102,8 +97,8 @@ class ActorEnricher:
             names = [actor.get('actor_name', '') for actor in actors]
             functions = [actor.get('actor_function', '') for actor in actors] 
             parties = [actor.get('actor_pp', '') for actor in actors]
-            
             return names, functions, parties
+        
         except (json.JSONDecodeError, AttributeError):
             return [], [], []
     
@@ -220,6 +215,11 @@ class ActorEnricher:
             .fillna(0)
             .reset_index()
         )
+
+        # if one of the function columns is missing, add it with zeros
+        for func in valid_functions:
+            if func not in functions_df.columns:
+                functions_df[func] = 0
         
         # Rename columns
         functions_df = functions_df.rename(columns={
@@ -385,7 +385,7 @@ class ActorEnricher:
         latest = df.iloc[0]
         return {
             "party_name": latest["party"],
-            "party_short": latest["short_name"] or None
+            "party_name_short": latest["short_name"] or None
         }
     
     def fetch_party_info(self, name: str, language: str = "nl") -> pd.Series:
@@ -397,23 +397,25 @@ class ActorEnricher:
             language: Language code
             
         Returns:
-            Series with party_name and party_short
+            Series with party_name and party_name_short
         """
         try:
             result = self.get_latest_party_from_wikidata(name, language=language)
             if result:
                 return pd.Series({
                     "party_name": result["party_name"],
-                    "party_short": result["party_short"]
+                    "party_name_short": result["party_name_short"]
                 })
         except Exception as e:
             print(f"Error fetching party info for {name}: {e}")
         
-        return pd.Series({"party_name": None, "party_short": None})
+        return pd.Series({"party_name": None, "party_name_short": None})
 
 
-    def enrich_political_actors(self, actor_df: Optional[pd.DataFrame] = None,
-        use_wikidata: bool = True, wikidata_language: str = "nl") -> pd.DataFrame:
+    def enrich_political_actors(self, 
+                                actor_df: Optional[pd.DataFrame] = None,
+                                use_wikidata: bool = True, 
+                                wikidata_language: str = "nl") -> pd.DataFrame:
         """        
         Enrichment pipeline for politicians (function 'a', NER person):
         1. Extract core names using NER
@@ -468,20 +470,20 @@ class ActorEnricher:
         # Step 2: Match against party reference data
         if self.party_reference_df is not None:
             print("Matching against party reference data...")
-            self.party_reference_df['person_name'] = self.party_reference_df['person_name'].str.title().str.strip()
+            self.party_reference_df['politician_name'] = self.party_reference_df['politician_name'].str.title().str.strip()
             political_actors = political_actors.merge(
-                self.party_reference_df[['person_name', 'party_short', 'party_name']],
+                self.party_reference_df[['politician_name', 'party_name_short', 'party_name']],
                 left_on='core_actor_name',
-                right_on='person_name',
+                right_on='politician_name',
                 how='left'
             )
-            political_actors = political_actors.drop(columns=['person_name'], errors='ignore')
+            political_actors = political_actors.drop(columns=['politician_name'], errors='ignore')
             
             matched_count = political_actors['party_name'].notna().sum()
             print(f"Matched {matched_count} actors with reference data")
         else:
             political_actors['party_name'] = None
-            political_actors['party_short'] = None
+            political_actors['party_name_short'] = None
         
         # Step 3: Query Wikidata for missing information
         if use_wikidata:
@@ -516,12 +518,14 @@ class ActorEnricher:
                         result = wikidata_results[name]
                         if pd.notna(result['party_name']):
                             political_actors.at[idx, 'party_name'] = result['party_name']
-                            political_actors.at[idx, 'party_short'] = result['party_short']
+                            political_actors.at[idx, 'party_name_short'] = result['party_name_short']
 
                 # Add wikidata results to the party reference df for future use
                 print("Updating party reference data with Wikidata results...")
                 wikidata_df = pd.DataFrame.from_dict(wikidata_results, orient='index').reset_index()
-                wikidata_df = wikidata_df.rename(columns={'index': 'person_name'})
+                wikidata_df = wikidata_df.rename(columns={'index': 'politician_name', 
+                                                          'party_name_short': 'party_name_short'})
+                
                 self.party_reference_df = pd.concat([self.party_reference_df, wikidata_df], 
                                                     ignore_index=True)
                 
@@ -541,10 +545,10 @@ class ActorEnricher:
             print("Merging with ideology scores...")
             political_actors = political_actors.merge(
                 self.ideology_reference_df,
-                left_on='party_short',
-                right_on='party',
+                on='party_name_short',
                 how='left'
             )
+            
             political_actors = political_actors.drop(columns=['party'], errors='ignore')
             
             ideology_matched = political_actors['lrgen'].notna().sum()
@@ -609,8 +613,7 @@ def main(args):
         actor_data_path=args.actor_data_path,
         id_column=args.id_column,
         language=args.language,
-        party_reference_path=args.party_reference_path,
-        ideology_reference_path=args.ideology_reference_path
+        political_data_path=args.political_data_path,
     )
 
     # Run full enrichment pipeline
@@ -669,7 +672,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_prefix", 
         type=str, 
-        required=True,
+        default="actors_output",
         help="Prefix for output CSV files (will create _expanded.csv, _functions.csv, _political.csv)"
     )
     parser.add_argument(
@@ -697,18 +700,12 @@ if __name__ == "__main__":
         default="nl",
         help="Language code for Wikidata queries (default: 'nl')"
     )
-    
     # Reference data arguments
     parser.add_argument(
-        "--party_reference_path",
+        "--political_data_path",
         type=str,
-        help="Path to CSV with party reference data (columns: person_name, party_short, party_name)"
+        help="Path to CSV with party reference data (columns: person_name, party_name_short, party_name)"
     )
-    parser.add_argument(
-        "--ideology_reference_path",
-        type=str,
-        help="Path to CSV with party ideology scores (columns: party, lrgen, lrecon, galtan)"
-    )
-    
+
     args = parser.parse_args()
     main(args)
