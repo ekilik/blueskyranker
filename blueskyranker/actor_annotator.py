@@ -10,15 +10,19 @@ import argparse
 import time
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
+import unicodedata
 
 class ActorAnnotator:
-    def __init__(self, model_name: str = "gpt-oss:20b", seed: int = 0, 
-                 ollama_host: str = "http://localhost:11434", timeout: int = 120):
+    def __init__(self, model_name: str = "gpt-oss:20b", 
+                 seed: int = 0, 
+                 ollama_host: str = "http://localhost:11434", 
+                 timeout: int = 120):
+        
         self.model_name = model_name
         self.seed = seed
         self.system_prompt = None
         self.ollama_host = ollama_host
-        self.timeout = timeout  # ADD THIS LINE
+        self.timeout = timeout  
         self.main_prompt = None
         self._model_checked = False
         self._load_prompts()
@@ -41,7 +45,7 @@ class ActorAnnotator:
         del self.client
         
         # Create new client with timeout
-        self.client = Client(host=self.ollama_host, timeout=self.timeout)  # ADD timeout parameter
+        self.client = Client(host=self.ollama_host, timeout=self.timeout)  
         print("Ollama client recreated")
 
     def _restart_ollama_server(self):
@@ -135,19 +139,13 @@ class ActorAnnotator:
         ]
         return messages
     
-    def extract_actors_from_content(self, news_content: str, ollama_model: str = None, 
-                                   timeout_seconds: int = None) -> Tuple[str, str]:
+    def extract_actors_from_content(self, news_content: str, ollama_model: str = None) -> Tuple[str, str]:
         """Extract raw LLM response from news content using Ollama.
-        Uses Ollama's built-in timeout, restarts client after timeout.
+        Uses Ollama's built-in timeout through client, restarts client after timeout.
         Has a pre-set num_ctx value to handle longer articles, can be adapted if needed.
-        Timeout is handled at the client level. 120 seconds suffice.
         """
         if ollama_model is None:
             ollama_model = self.model_name
-        
-        # Use instance timeout if not specified
-        if timeout_seconds is None:
-            timeout_seconds = self.timeout
 
         if not news_content or len(news_content.strip()) < 50:
             return "", "" 
@@ -182,19 +180,41 @@ class ActorAnnotator:
             return "", ""
             
         except TimeoutError:
-            print(f"Request timed out after {timeout_seconds}s - skipping article and restarting client")
+            print(f"Request timed out after {self.timeout}s - skipping article and restarting client")
             self._recreate_client()
             return "", ""
         
         except Exception as e:
             error_msg = str(e).lower()
             # Check if it's a connection-related error
-            if any(keyword in error_msg for keyword in ['connection', 'timeout', 'broken pipe', 'reset', 'refused']):
+            if any(keyword in error_msg for keyword in ['connection', 'timeout', 'broken pipe', 'reset', 'refused', 'timed out']):
                 print(f"Connection error: {e} - restarting client")
                 self._recreate_client()
             else:
                 print(f"Error during extraction: {e}")
             return "", ""
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text by handling special characters and encoding issues.
+        
+        Handles:
+        - Unicode normalization (ö, ü, ä, etc.)
+        - Mojibake/encoding artifacts
+        - Extra whitespace
+        """
+        if not text:
+            return text
+        
+        # Fix common mojibake patterns (if text was incorrectly encoded)
+        text = text.encode('latin1', errors='ignore').decode('utf-8', errors='ignore')
+        
+        # Normalize Unicode characters (NFC form)
+        text = unicodedata.normalize('NFC', text)
+        
+        # Clean up whitespace
+        text = ' '.join(text.split())
+        
+        return text.strip()
 
     def clean_and_parse_actors(self, llm_response: str) -> Optional[str]:
         """Clean LLM response and extract structured actor data."""
@@ -242,15 +262,15 @@ class ActorAnnotator:
                 # If no standard fields but has alternatives, it's a field name issue
                 if not has_standard_fields and has_alternative_fields:
                     print("Actors use alternative field names - trying fallback")
-                    return self._fallback_clean_and_parse_actors(llm_response)
+                    return self._fallback_llm_output_cleaner(llm_response)
                 
             cleaned_actors = []
             for actor in actors_list:
                 if isinstance(actor, dict) and 'actor_name' in actor:
                     cleaned_actor = {
-                        'actor_name': str(actor.get('actor_name', '')).strip(),
-                        'actor_function': str(actor.get('actor_function', '')).strip(),
-                        'actor_pp': str(actor.get('actor_pp', '')).strip()
+                        'actor_name': self._normalize_text(str(actor.get('actor_name', '')).strip()),
+                        'actor_function': self._normalize_text(str(actor.get('actor_function', '')).strip()),
+                        'actor_pp': self._normalize_text(str(actor.get('actor_pp', '')).strip())
                     }
                     if cleaned_actor['actor_name']:
                         cleaned_actors.append(cleaned_actor)
@@ -267,7 +287,7 @@ class ActorAnnotator:
             if len(llm_response.strip()) > 20:  # Has substantial content
                 print("Trying fallback due to exception")
                 try: 
-                    fallback_result = self._fallback_clean_and_parse_actors(llm_response)
+                    fallback_result = self._fallback_llm_output_cleaner(llm_response)
                     if fallback_result:
                         return fallback_result
                 except Exception as fe:
@@ -426,9 +446,9 @@ class ActorAnnotator:
                     break
         
         return {
-            'actor_name': actor_name,
-            'actor_function': actor_function,
-            'actor_pp': actor_pp
+            'actor_name': self._normalize_text(actor_name),
+            'actor_function': self._normalize_text(actor_function),
+            'actor_pp': self._normalize_text(actor_pp)
         }
 
     def _extract_actor_json_from_output(self, actors_text: str) -> List[Dict[str, str]]:
@@ -493,8 +513,7 @@ class ActorAnnotator:
                           df: pd.DataFrame, 
                           text_column: str, 
                           id_column: str, 
-                          title_column: str,
-                          timeout_seconds: int) -> pd.DataFrame:
+                          title_column: str) -> pd.DataFrame:
         """
         Process a DataFrame and return it with actors column added.
         For in-memory processing without file output.
@@ -518,27 +537,32 @@ class ActorAnnotator:
         # Process each article
         results = []
         cleaned_results = []
+        article_count = 0
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
-            uri = row.get(id_column, idx)
-            text = df_result.at[idx, 'full_text']
-            actors_json, cleaned_response = self.extract_actors_from_content(text, timeout_seconds=timeout_seconds)
+            # Recreate client every 10 articles to prevent connection/memory issues
+            if article_count > 0 and article_count % 10 == 0:
+                print(f"\n⚙ Recreating client after {article_count} articles...")
+                self._recreate_client()
 
+            text = df_result.at[idx, 'full_text']
+
+            actors_json, cleaned_response = self.extract_actors_from_content(text)
             results.append(actors_json)
             cleaned_results.append(cleaned_response)
+            article_count += 1
             
             # Brief pause 
             time.sleep(0.1)
         
         df_result['news_actors'] = results
         df_result['raw_response'] = cleaned_results
-        return df_result   
-
+        return df_result 
 
     def chunk_dataframe(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
         """Split dataframe into chunks for batch processing"""
         return [df[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
     
-    def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str, timeout: int = 120) -> Tuple[List[str], List[str]]:
+    def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str) -> Tuple[List[str], List[str]]:
         """Process a batch of articles and return raw and cleaned results.
         
         Returns:
@@ -549,16 +573,20 @@ class ActorAnnotator:
         
         for idx, row in df_batch.iterrows():
             text = row.get(text_column, '')
-            raw_response, cleaned_response = self.extract_actors_from_content(text, timeout_seconds=timeout)  
+            raw_response, cleaned_response = self.extract_actors_from_content(text)  
             raw_output.append(raw_response)
             cleaned_output.append(cleaned_response)
         
         return raw_output, cleaned_output
 
 
-    def process_all_batches(self, df: pd.DataFrame, batch_size: int, 
-                    output_file_path: str, text_column: str, id_column: str,
-                    timeout: int = 120, start_batch: int = 0) -> None:
+    def process_all_batches(self, 
+                            df: pd.DataFrame, 
+                            batch_size: int, 
+                            output_file_path: str, 
+                            text_column: str, 
+                            id_column: str, 
+                            start_batch: int = 0) -> None:
         """Process all batches with memory management"""
         import gc
         import psutil
@@ -600,7 +628,7 @@ class ActorAnnotator:
             batch = batch.reset_index(drop=True)
             
             # Process batch
-            batch_results, cleaned_results = self.process_articles_batch(batch, text_column, timeout=timeout)
+            batch_results, cleaned_results = self.process_articles_batch(batch, text_column)
             
             batch['news_actors_raw'] = batch_results
             batch['news_actors'] = cleaned_results
@@ -669,11 +697,12 @@ def main(args):
     if not os.path.exists(args.data_path):
         print(f"Error: Input file not found: {args.data_path}")
         return
-    
+
     # Initialize annotator
     annotator = ActorAnnotator(
         model_name=args.model_name,
         seed=args.seed,
+        timeout=args.timeout,
     )
 
     # Ensure model is available
@@ -703,7 +732,6 @@ def main(args):
         output_file_path=args.output_file_path,
         text_column='full_text',  
         id_column=args.id_column,
-        timeout=args.timeout,
         start_batch=args.start_batch  
     )
 

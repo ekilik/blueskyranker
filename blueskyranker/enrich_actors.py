@@ -2,6 +2,7 @@ import pandas as pd
 import json
 import csv
 import re
+import unicodedata
 import os
 import argparse
 from typing import List, Dict, Optional, Tuple
@@ -25,6 +26,8 @@ class ActorEnricher:
             actor_df: Optional[pd.DataFrame] = None, 
             id_column: str = 'news_id', 
             language: str = 'en',
+            center_parties: bool = True,
+            save_politicians_df: bool = False,
             political_data_path: Optional[str] = None):
         
         """
@@ -35,12 +38,16 @@ class ActorEnricher:
             actor_df: DataFrame with actor annotations (alternative to path if path not provided)
             id_column: Name of the column containing unique article identifiers
             language: Language for NER processing ('en', 'nl', etc.)
-            political_data_path: Path to CSV with party reference data (columns: person_name, party_name_short, party_name)
+            center_parties: Whether the country has center parties in addition to left and right
+            save_politicians_df: Whether to save enriched political actors to _political.csv file
+            political_data_path: Path to CSV with party reference data (columns: name, party, lrgen_category)
         """
 
         self.actor_data_path = actor_data_path
         self.id_column = id_column
         self.language = language
+        self.center_parties = center_parties
+        self.save_politicians_df = save_politicians_df
 
         # Load actor data
         self.actor_df = actor_df if actor_df is not None else self._load_actor_data()
@@ -55,16 +62,22 @@ class ActorEnricher:
 
         # Load reference data
         self.political_df = self._load_political_data(political_data_path)
-        self.party_reference_df = self.political_df[['politician_name', 'party_name_short', 'party_name']].drop_duplicates() if self.political_df is not None else None
-        self.ideology_reference_df = self.political_df[['party_name_short', 'lrgen', 'lrecon', 'galtan']].drop_duplicates() if self.political_df is not None else None
+        self.politician_reference_df = self.political_df[['name', 'party', 'lrgen_category']].drop_duplicates() if self.political_df is not None else None
+        self.ideology_reference_df = self.political_df[['party', 'lrgen_category']].drop_duplicates() if self.political_df is not None else None
 
+        # add two parties to ideology reference data if not already present: GROENLINKS-PVDA left, and CU center
+        additional_parties = pd.DataFrame([
+                {'party': 'GROENLINKS-PVDA', 'lrgen_category': 'left'},
+                {'party': 'CU', 'lrgen_category': 'center'}
+            ])
+        self.ideology_reference_df = pd.concat([self.ideology_reference_df, additional_parties], ignore_index=True).drop_duplicates(subset=['party'], keep='first')
 
     def _load_actor_data(self) -> pd.DataFrame:
             """Load actor data from CSV file into a DataFrame"""
             if self.actor_data_path:
                 return pd.read_csv(
                     self.actor_data_path, 
-                    index=False, 
+                    index_col=False, 
                     sep=';', 
                     quoting=csv.QUOTE_NONNUMERIC)
             else:
@@ -74,7 +87,9 @@ class ActorEnricher:
         """Load party reference data for matching."""
         if path and os.path.exists(path):
             print(f"Loading party reference data from {path}")
-            return pd.read_csv(path, sep=';', quoting=csv.QUOTE_NONNUMERIC)
+            df = pd.read_csv(path, sep=';', quoting=csv.QUOTE_NONNUMERIC)
+            df = df.drop_duplicates(subset=['name'], keep='first')
+            return df
         return None
 
     
@@ -158,7 +173,7 @@ class ActorEnricher:
         return pd.DataFrame(rows)
     
     # calculate nr of unique actors per function per article
-    def calculate_actors_per_function(self, actor_df: pd.DataFrame, id_column: str) -> pd.DataFrame:
+    def calculate_actors_per_function(self, actor_df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate number of unique actors per function for each article.
         
@@ -185,21 +200,9 @@ class ActorEnricher:
             print("No actors with valid functions (a, b, c, d) found.")
             return pd.DataFrame()
         
-        # Group by article ID and actor function, count unique actor names
-        unique_counts = (
-            actor_df
-            .groupby([self.id_column, 'actor_function'])['actor_name']
-            .nunique()
-            .reset_index()
-        )
-        unique_counts = unique_counts.rename(columns={'actor_name': 'nr_actors'})
-        
-        # Drop if function is not in ['a', 'b', 'c', 'd']
-        actor_df = actor_df[actor_df['actor_function'].isin(['a', 'b', 'c', 'd'])]
-
         # Group by article ID and actor function, then count unique actor names
         unique_counts = (actor_df
-                         .groupby([id_column, 'actor_function'])['actor_name']
+                         .groupby([self.id_column, 'actor_function'])['actor_name']
                          .nunique()
                          .reset_index())
         unique_counts = unique_counts.rename(columns={'actor_name': 'nr_actors'})
@@ -232,13 +235,6 @@ class ActorEnricher:
         # Calculate total number of unique actors
         actor_cols = [col for col in functions_df.columns if col.startswith('nr_actors_')]
         functions_df['nr_actors_total'] = functions_df[actor_cols].sum(axis=1)
-
-        # Calculate percentage columns
-        for col in actor_cols:
-            perc_col = col.replace('nr_actors_', 'perc_actors_')
-            functions_df[perc_col] = (
-                functions_df[col] / functions_df['nr_actors_total']
-            ).fillna(0)
         
         return functions_df
         
@@ -298,7 +294,7 @@ class ActorEnricher:
         
         return sparqlw.query().convert()
 
-    def _search_wikidata(self, name: str, language: str = "en") -> Optional[str]:
+    def _search_wikidata(self, name: str, language: str) -> Optional[str]:
         """Search for a person on Wikidata and return their QID."""
         HEADERS = {"User-Agent": "ActorEnricher/1.0"}
         
@@ -328,7 +324,7 @@ class ActorEnricher:
         
         return hits[0]["id"] if hits else None
 
-    def get_latest_party_from_wikidata(self, name: str, language: str = "nl"
+    def get_latest_party_from_wikidata(self, name: str, language: str
                                        ) -> Optional[Dict[str, Optional[str]]]:
         """
         Query Wikidata for a person's latest party affiliation.
@@ -388,7 +384,7 @@ class ActorEnricher:
             "party_name_short": latest["short_name"] or None
         }
     
-    def fetch_party_info(self, name: str, language: str = "nl") -> pd.Series:
+    def fetch_party_info(self, name: str, language: str = "en") -> pd.Series:
         """
         Wrapper to safely fetch party information from Wikidata.
         
@@ -411,23 +407,132 @@ class ActorEnricher:
         
         return pd.Series({"party_name": None, "party_name_short": None})
 
+    def _normalize_string(self, s: str) -> str:
+        """Unicode-safe normalization + uppercase."""
+        if not isinstance(s, str):
+            return ""
+        s = unicodedata.normalize("NFKC", s)
+        return s.strip().upper()
+    
+    def _tokenize_name(self, name: str, stop_tokens: set) -> list[str]:
+        """
+        Normalize + split name into meaningful tokens.
+        Removes titles but keeps surname particles.
+        """
+        name = self._normalize_string(name)
 
+        # Replace hyphens with spaces for flexible matching
+        name = name.replace("-", " ")
+
+        tokens = name.split()
+
+        # Remove stop tokens
+        tokens = [t for t in tokens if t not in stop_tokens]
+
+        return tokens
+    
+    def _extract_surname(self, tokens: list[str]) -> str:
+        """
+        Extract surname including particles.
+        Example:
+        ['MARK', 'RUTTE'] → RUTTE
+        ['JAN', 'VAN', 'DIJK'] → VAN DIJK
+        """
+        if not tokens:
+            return ""
+
+        surname_parts = []
+        i = len(tokens) - 1
+
+        # Always include last token
+        surname_parts.insert(0, tokens[i])
+        i -= 1
+
+        # Include preceding particles
+        while i >= 0 and tokens[i] in {"VAN", "DER", "DEN", "DE", "VON", "ZU", "TEN", "TER", "LA", "LE", "DI"}:
+            surname_parts.insert(0, tokens[i])
+            i -= 1
+
+        return " ".join(surname_parts)
+    
+    def _surname_match(self, partial_name: str, full_name: str) -> bool:
+        """
+        Precision-controlled surname matching for political actors.
+        """
+
+        if not partial_name or not full_name:
+            return False
+
+                # First we make a list of possible function titles that could precede surnames in ENG, NL, DE, TR
+        STOP_TOKENS = {
+            # NL
+            "KAMERLID", "TWEEDE", "EERSTE", "LID", "STAATSSECRETARIS", "MINISTER",
+            "MINISTER-PRESIDENT", "VICEPREMIER", "PREMIER", "FRACTIEVOORZITTER",
+            "BURGEMEESTER", "WETHOUDER", "RAADSLID", "SENATOR", "VOORZITTER", "DEMISSIONAIR",
+
+            # DE
+            "BUNDESKANZLER", "KANZLER", "MINISTERPRÄSIDENT", "ABGEORDNETER",
+            "ABGEORDNETE", "BUNDESTAG", "LANDTAG", "BÜRGERMEISTER",
+            "VORSITZENDER", "GESCHÄFTSFÜHREND",
+
+            # EN
+            "PRIME", "MINISTER", "SECRETARY", "STATE", "MP", "MEP",
+            "MAYOR", "GOVERNOR", "PRESIDENT", "CHAIR", "CHAIRMAN",
+            "CHAIRWOMAN", "SPEAKER", "MEMBER",
+
+            # IE
+            "TAOISEACH", "TÁNAISTE", "TD",
+
+            # TR
+            "BAKAN", "BAKANI", "BAŞBAKAN", "CUMHURBAŞKANI",
+            "MILLETVEKILI", "BELEDIYE", "BELEDIYE BAŞKANI"
+        }
+
+        partial_tokens = self._tokenize_name(partial_name, STOP_TOKENS)
+        full_tokens = self._tokenize_name(full_name, STOP_TOKENS)
+
+        if not partial_tokens or not full_tokens:
+            return False
+
+        partial_surname = self._extract_surname(partial_tokens)
+        full_surname = self._extract_surname(full_tokens)
+
+        # --- Step 1: surnames must match exactly ---
+        if partial_surname != full_surname:
+            return False
+
+        # --- Step 2: If only surname provided ---
+        if len(partial_tokens) == 1:
+            # avoid false positives like "LI", "NG"
+            if len(partial_surname) < 4:
+                return False
+            return True
+
+        # --- Step 3: If firstname present, require at least one match ---
+        partial_firstnames = set(partial_tokens[:-1])
+        full_firstnames = set(full_tokens[:-1])
+
+        if partial_firstnames & full_firstnames:
+            return True
+
+        return False
+
+    
     def enrich_political_actors(self, 
                                 actor_df: Optional[pd.DataFrame] = None,
                                 use_wikidata: bool = True, 
-                                wikidata_language: str = "nl") -> pd.DataFrame:
+                                language: str = "en") -> pd.DataFrame:
         """        
         Enrichment pipeline for politicians (function 'a', NER person):
         1. Extract core names using NER
-        2. Match against party reference data (if available)
+        2. Match against party reference data (if available) first directly, then surname matching, then party name mentions
         3. Query Wikidata for missing information (if use_wikidata=True)
         4. Merge with ideology scores (if available)
         
         Args:
             actor_df: Optional actor-level DataFrame. If None, expands self.actor_df
             use_wikidata: Whether to query Wikidata for missing party info
-            wikidata_language: Language code for Wikidata queries
-            
+            language: Language code for Wikidata queries
         Returns:
             DataFrame with enriched actor information including party affiliations
         """
@@ -454,40 +559,159 @@ class ActorEnricher:
             self.extract_core_name
         )
         
-        # Remove rows where core name extraction failed
-        political_actors = political_actors[
-            political_actors['core_actor_name'].notna()
-        ].copy()
-        
         if political_actors.empty:
             print("No valid person names extracted.")
             return pd.DataFrame()
         
         print(f"Extracted {len(political_actors)} valid person names")
 
-        political_actors['core_actor_name'] = political_actors['core_actor_name'].str.title().str.strip()
+        political_actors['core_actor_name_upper'] = political_actors['core_actor_name'].apply(self._normalize_string)
+        political_actors['actor_name_upper'] = political_actors['actor_name'].apply(self._normalize_string)
+        self.politician_reference_df['name'] = self.politician_reference_df['name'].apply(self._normalize_string)
         
-        # Step 2: Match against party reference data
-        if self.party_reference_df is not None:
-            print("Matching against party reference data...")
-            self.party_reference_df['politician_name'] = self.party_reference_df['politician_name'].str.title().str.strip()
-            political_actors = political_actors.merge(
-                self.party_reference_df[['politician_name', 'party_name_short', 'party_name']],
-                left_on='core_actor_name',
-                right_on='politician_name',
-                how='left'
-            )
-            political_actors = political_actors.drop(columns=['politician_name'], errors='ignore')
+        # Step 2: Match against party reference data using multi-step matching strategy
+        if self.politician_reference_df is not None:
+            print("Matching against politician and party reference data...")
             
-            matched_count = political_actors['party_name'].notna().sum()
-            print(f"Matched {matched_count} actors with reference data")
-        else:
-            political_actors['party_name'] = None
-            political_actors['party_name_short'] = None
+            # Initialize columns for matched data
+            political_actors['party'] = None
+            political_actors['lrgen_category'] = None
+            political_actors['matched_name'] = None
+            
+            # Step 2.1: Exact match on core_actor_name
+            print("Step 2.1: Exact matching on core_actor_name...")
+            political_actors = political_actors.merge(
+                self.politician_reference_df,
+                left_on='core_actor_name_upper',
+                right_on='name',
+                how='left',
+                suffixes=('', '_ref')
+            )
+            # Move merged values into your working columns
+            political_actors['party'] = political_actors['party_ref']
+            political_actors['lrgen_category'] = political_actors['lrgen_category_ref']
+            political_actors['matched_name'] = political_actors['name']
+
+            # Clean up helper columns
+            political_actors.drop(
+                columns=['party_ref', 'lrgen_category_ref', 'name'],
+                inplace=True
+            )
+
+            exact_count = political_actors['party'].notna().sum()
+            print(f"  → Matched {exact_count} actors with exact core_actor_name match")
+            print(f"These names are matched with reference data: {political_actors.loc[political_actors['party'].notna(), ['core_actor_name', 'matched_name']].drop_duplicates().to_dict(orient='records')}")
+            
+            # Step 2.2: Token match on core_actor_name (for unmatched rows)
+            print("Step 2.2: Token matching on core_actor_name...")
+            unmatched_mask = political_actors['party'].isna()
+            token_match_count = 0
+            
+            for idx in political_actors[unmatched_mask].index:
+                core_name = political_actors.at[idx, 'core_actor_name_upper']
+                for _, ref_row in self.politician_reference_df.iterrows():
+                    if self._surname_match(core_name, ref_row['name']):
+                        political_actors.at[idx, 'party'] = ref_row['party']
+                        political_actors.at[idx, 'lrgen_category'] = ref_row['lrgen_category']
+                        political_actors.at[idx, 'matched_name'] = ref_row['name']
+                        token_match_count += 1
+                        break
+
+            print(f"  → Matched {token_match_count} actors with token match on core_actor_name")
+            print(f"These names are matched with reference data: {political_actors.loc[political_actors['party'].notna(), ['core_actor_name', 'matched_name']].drop_duplicates().to_dict(orient='records')}")
+                
+            # Step 2.3: Exact + token match on actor_name (for still unmatched rows)
+            print("Step 2.3: Matching on original actor_name...")
+            unmatched_mask = political_actors['party'].isna()
+            actor_name_count = 0
+            
+            for idx in political_actors[unmatched_mask].index:
+                actor_name = political_actors.at[idx, 'actor_name_upper']
+                # Try exact match first
+                exact_ref = self.politician_reference_df[self.politician_reference_df['name'] == actor_name]
+                if not exact_ref.empty:
+                    political_actors.at[idx, 'party'] = exact_ref.iloc[0]['party']
+                    political_actors.at[idx, 'lrgen_category'] = exact_ref.iloc[0]['lrgen_category']
+                    political_actors.at[idx, 'matched_name'] = exact_ref.iloc[0]['name']
+                    actor_name_count += 1
+                    continue
+                
+                # Try token match
+                for _, ref_row in self.politician_reference_df.iterrows():
+                    if self._surname_match(actor_name, ref_row['name']):
+                        political_actors.at[idx, 'party'] = ref_row['party']
+                        political_actors.at[idx, 'lrgen_category'] = ref_row['lrgen_category']
+                        political_actors.at[idx, 'matched_name'] = ref_row['name']
+                        actor_name_count += 1
+                        break
+            
+            print(f"  → Matched {actor_name_count} actors with actor_name matching")
+            
+            # Step 2.4: Check for party name mentions in actor_name or core_actor_name
+            print("Step 2.4: Checking for party name mentions...")
+            unmatched_mask = political_actors['party'].isna()
+            party_mention_count = 0
+            new_rows = []
+
+            for idx in political_actors[unmatched_mask].index:
+                actor_name = str(political_actors.at[idx, 'actor_name_upper']) # cleaned name
+                actor_name = re.sub(r"[-–—/]", " ", actor_name)
+                actor_name = re.sub(r"\s+", " ", actor_name).strip()
+
+                matched_parties = []
+                
+                for _, ref_row in self.ideology_reference_df.iterrows():
+                    party_name_original = str(ref_row['party']).strip()  # Keep original for storage
+                    party_name_upper = self._normalize_string(party_name_original)
+                    party_name_upper = re.sub(r"[-–—/]", " ", party_name_upper)
+                    party_name_upper = re.sub(r"\s+", " ", party_name_upper).strip()
+                    
+                    pattern = rf"(?<!\w){re.escape(party_name_upper)}(?!\w)"
+
+                    if re.search(pattern, actor_name):
+                        matched_parties.append({
+                            'party': party_name_original, 
+                            'matched_name': party_name_original,
+                            'lrgen_category': ref_row['lrgen_category']
+                        })
+                
+                # For each matched party, create or update rows
+                if matched_parties:
+                    party_mention_count += 1
+
+                    # Update original row with first match
+                    political_actors.at[idx, 'party'] = matched_parties[0]['party']
+                    political_actors.at[idx, 'lrgen_category'] = matched_parties[0]['lrgen_category']
+                    political_actors.at[idx, 'matched_name'] = matched_parties[0]['matched_name']
+                    
+                    # Create new rows for additional matches (starting from second match)
+                    for match in matched_parties[1:]:
+                        row_copy = political_actors.loc[idx].copy()
+                        row_copy['party'] = match['party']
+                        row_copy['lrgen_category'] = match['lrgen_category']
+                        row_copy['matched_name'] = match['matched_name']
+                        
+                        new_rows.append(row_copy)
+
+            # Append new rows for additional matches
+            if new_rows:
+                new_rows_df = pd.DataFrame(new_rows)
+                # Deduplicate new rows
+                # new_rows_df = new_rows_df.drop_duplicates(subset=[self.id_column, 'actor_name', 'matched_name'])
+                political_actors = pd.concat([political_actors, new_rows_df], ignore_index=True)            
+            
+            print(f". → Matched {party_mention_count} actors with party name mentions")
+            
+            total_matched = political_actors['party'].notna().sum()
+            print(f"\nTotal matched: {total_matched} actors with reference data")
         
+        else:
+            political_actors['party'] = None
+            political_actors['lrgen_category'] = None
+
         # Step 3: Query Wikidata for missing information
         if use_wikidata:
-            missing_party = political_actors['party_name'].isna()
+            missing_party = political_actors['party'].isna()
             missing_count = missing_party.sum()
             
             if missing_count > 0:
@@ -505,69 +729,137 @@ class ActorEnricher:
                 for name in tqdm(unique_missing, desc="Wikidata queries"):
                     wikidata_results[name] = self.fetch_party_info(
                         name, 
-                        language=wikidata_language
+                        language=language
                     )
                     # Small delay to avoid rate limiting
                     import time
                     time.sleep(0.1)
+
+                # Match the party name with ideology from reference data if available
+                if self.ideology_reference_df is not None:
+                    for name, result in wikidata_results.items():
+                        party_name = result.get('party_name_short')
+                        # normalize party name for matching
+                        party_name = self._normalize_string(party_name) if party_name else None
+                        if party_name:
+                            ideology_row = self.ideology_reference_df[
+                                self.ideology_reference_df['party'] == party_name
+                            ]
+                            if not ideology_row.empty:
+                                result['lrgen_category'] = ideology_row.iloc[0]['lrgen_category']
+                            else:
+                                result['lrgen_category'] = None
+                        else:
+                            result['lrgen_category'] = None
                 
                 # Apply results to DataFrame
                 for idx in political_actors[missing_party].index:
                     name = political_actors.at[idx, 'core_actor_name']
                     if name in wikidata_results:
                         result = wikidata_results[name]
-                        if pd.notna(result['party_name']):
-                            political_actors.at[idx, 'party_name'] = result['party_name']
-                            political_actors.at[idx, 'party_name_short'] = result['party_name_short']
+                        if pd.notna(result['party_name_short']):
+                            political_actors.at[idx, 'party'] = result['party_name_short']
+                        if pd.notna(result.get('lrgen_category')):
+                            political_actors.at[idx, 'lrgen_category'] = result['lrgen_category']
 
                 # Add wikidata results to the party reference df for future use
                 print("Updating party reference data with Wikidata results...")
                 wikidata_df = pd.DataFrame.from_dict(wikidata_results, orient='index').reset_index()
-                wikidata_df = wikidata_df.rename(columns={'index': 'politician_name', 
-                                                          'party_name_short': 'party_name_short'})
+                wikidata_df = wikidata_df.rename(columns={'index': 'name', 
+                                                          'party': 'party_name_short'})
                 
-                self.party_reference_df = pd.concat([self.party_reference_df, wikidata_df], 
+                self.politician_reference_df = pd.concat([self.politician_reference_df, wikidata_df], 
                                                     ignore_index=True)
                 
-                # write updated party reference back to file if path provided
-                if self.party_reference_df is not None and self.actor_data_path is not None:
-                    party_ref_path = os.path.splitext(self.actor_data_path)[0] + '_party_reference.csv'
-                    print(f"Writing updated party reference data to {party_ref_path}...")
-                    self.party_reference_df.to_csv(
-                        party_ref_path, 
+                # Save updated politician reference data if path is set
+                if self.actor_data_path is not None:
+                    politician_ref_path = os.path.splitext(self.actor_data_path)[0] + '_politicians_updated.csv'
+                    print(f"Writing updated politician reference data to {politician_ref_path}...")
+                    self.politician_reference_df.to_csv(
+                        politician_ref_path, 
                         sep=';', 
                         quoting=csv.QUOTE_NONNUMERIC, 
                         index=False
                     )
-        
-        # Step 4: Merge with ideology scores
-        if self.ideology_reference_df is not None:
-            print("Merging with ideology scores...")
-            political_actors = political_actors.merge(
-                self.ideology_reference_df,
-                on='party_name_short',
-                how='left'
-            )
-            
-            political_actors = political_actors.drop(columns=['party'], errors='ignore')
-            
-            ideology_matched = political_actors['lrgen'].notna().sum()
-            print(f"Matched {ideology_matched} actors with ideology scores")
+                
+
+        # drop if lrgen_category is missing
+        political_actors = political_actors[political_actors['lrgen_category'].notna()].copy()
         
         return political_actors
+    
+    def calculate_actors_per_partyideology(self, political_actors_df: pd.DataFrame, center_parties: bool) -> pd.DataFrame:
+        """
+        Calculate number of unique actors per party ideology category for each article.
+        
+        Args:
+            political_actors_df: DataFrame with enriched political actors (must include id_column and lrgen_category)
+
+        Returns:
+            DataFrame with columns: id_column, nr_actors_left, nr_actors_right, nr_actors_center, 
+            nr_actors_total, perc_actors_left, perc_actors_right, perc_actors_center
+        """
+
+        if political_actors_df.empty:
+            print("Political actors DataFrame is empty. Returning empty DataFrame.")
+            return pd.DataFrame()
+        
+        # Keep only valid ideology categories
+        valid_categories = ['left', 'right']
+        if center_parties:
+            valid_categories.append('center')
+        
+        political_actors_df = political_actors_df[political_actors_df['lrgen_category'].isin(valid_categories)]
+        
+        if political_actors_df.empty:
+            print("No actors with valid ideology categories found.")
+            return pd.DataFrame()
+        
+        # Group by article ID and ideology category, then count unique actor names
+        unique_counts = (political_actors_df
+                         .groupby([self.id_column, 'lrgen_category'])['actor_name']
+                         .nunique()
+                         .reset_index())
+        unique_counts = unique_counts.rename(columns={'actor_name': 'nr_actors'})
+        
+        # Pivot to have ideology categories as columns
+        ideology_df = (
+            unique_counts
+            .pivot(
+                index=self.id_column, 
+                columns='lrgen_category', 
+                values='nr_actors'
+            )
+            .fillna(0)
+            .reset_index()
+        )
+
+        # if one of the ideology columns is missing, add it with zeros
+        for category in valid_categories:
+            col_name = f"nr_actors_{category}"
+            if category not in ideology_df.columns:
+                ideology_df[col_name] = 0
+            else:
+                ideology_df.rename(columns={category: col_name}, inplace=True)
+        
+        # Calculate total number of unique actors
+        actor_cols = [col for col in ideology_df.columns if col.startswith('nr_actors_')]
+        ideology_df['nr_actors_total'] = ideology_df[actor_cols].sum(axis=1)
+        
+        return ideology_df
 
 
     def run_full_enrichment(
         self,
         use_wikidata: bool = True,
-        wikidata_language: str = "nl"
+        language: str = "en"
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Run the complete enrichment pipeline.
         
         Args:
             use_wikidata: Whether to query Wikidata for party information
-            wikidata_language: Language code for Wikidata queries
+            language: Language code for Wikidata queries
             
         Returns:
             Tuple of (expanded_df, functions_df, enriched_political_df)
@@ -594,15 +886,23 @@ class ActorEnricher:
         enriched_political_df = self.enrich_political_actors(
             expanded_df,
             use_wikidata=use_wikidata,
-            wikidata_language=wikidata_language
+            language=language
         )
         print(f"Enriched {len(enriched_political_df)} political actor records\n")
+
+        # Step 4: Calculate actors per party ideology
+        print("Step 4: Calculating actors per party ideology...")
+        ideology_df = self.calculate_actors_per_partyideology(
+            enriched_political_df,
+            center_parties=True
+        )
+        print(f"Generated ideology statistics for {len(ideology_df)} articles\n")
         
         print("="*60)
         print("ENRICHMENT PIPELINE COMPLETED")
         print("="*60 + "\n")
         
-        return expanded_df, functions_df, enriched_political_df
+        return expanded_df, functions_df, enriched_political_df, ideology_df
 
 
 def main(args):
@@ -614,12 +914,13 @@ def main(args):
         id_column=args.id_column,
         language=args.language,
         political_data_path=args.political_data_path,
+        save_politicians_df=args.save_politicians_df
     )
 
     # Run full enrichment pipeline
-    expanded_df, functions_df, enriched_political_df = enricher.run_full_enrichment(
+    expanded_df, functions_df, enriched_political_df, ideology_df = enricher.run_full_enrichment(
         use_wikidata=args.use_wikidata,
-        wikidata_language=args.wikidata_language
+        language=args.language
     )
 
     # Save outputs
@@ -647,14 +948,25 @@ def main(args):
     print(f"Saved function statistics to: {functions_path}")
     
     # Save enriched political actors
-    political_path = f"{args.output_prefix}_political.csv"
-    enriched_political_df.to_csv(
-        political_path, 
+    if enricher.save_politicians_df: 
+        political_path = f"{args.output_prefix}_political.csv"
+        enriched_political_df.to_csv(
+            political_path, 
+            index=False, 
+            sep=';', 
+            quoting=csv.QUOTE_NONNUMERIC
+        )
+    print(f"Saved enriched political actors to: {political_path}")
+    
+    # Save ideology statistics
+    ideology_path = f"{args.output_prefix}_ideology.csv"
+    ideology_df.to_csv(
+        ideology_path, 
         index=False, 
         sep=';', 
         quoting=csv.QUOTE_NONNUMERIC
     )
-    print(f"Saved enriched political actors to: {political_path}")
+    print(f"Saved ideology statistics to: {ideology_path}")
 
 
 if __name__ == "__main__":
@@ -673,7 +985,7 @@ if __name__ == "__main__":
         "--output_prefix", 
         type=str, 
         default="actors_output",
-        help="Prefix for output CSV files (will create _expanded.csv, _functions.csv, _political.csv)"
+        help="Prefix for output CSV files (will create _expanded.csv, _functions.csv, _political.csv, _ideology.csv)"
     )
     parser.add_argument(
         "--id_column", 
@@ -694,17 +1006,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Query Wikidata for missing party information"
     )
-    parser.add_argument(
-        "--wikidata_language",
-        type=str,
-        default="nl",
-        help="Language code for Wikidata queries (default: 'nl')"
-    )
     # Reference data arguments
     parser.add_argument(
         "--political_data_path",
         type=str,
-        help="Path to CSV with party reference data (columns: person_name, party_name_short, party_name)"
+        help="Path to CSV with party reference data (columns: name, party, lrgen_category)"
+    )
+
+    parser.add_argument(
+        "--save_politicians_df",
+        action="store_true",
+        help="Save updated politician reference data to file after Wikidata queries"
     )
 
     args = parser.parse_args()
