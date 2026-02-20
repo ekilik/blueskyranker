@@ -147,13 +147,19 @@ class ActorAnnotator:
         if ollama_model is None:
             ollama_model = self.model_name
 
+        # cutting too short articles to prevent unnecessary LLM calls 
         if not news_content or len(news_content.strip()) < 50:
             return "", "" 
+        
+        # cutting too long articles to prevent memory issues
+        MAX_CHARS = 12000
+        if len(news_content) > MAX_CHARS:
+            news_content = news_content[:MAX_CHARS] 
         
         if not self.system_prompt or not self.main_prompt:
             print("Prompts not loaded properly")
             return "", ""  
-        
+
         try:
             prompt = self.build_prompt(
                 system_prompt=self.system_prompt, 
@@ -166,7 +172,8 @@ class ActorAnnotator:
                 options={
                     'temperature': 0.0, 
                     'seed': self.seed,
-                    'num_ctx': 6144  
+                    'num_ctx': 6144, 
+                    'num_gpu': 999  # use all layers of the model 
                 }
             )
             
@@ -179,34 +186,53 @@ class ActorAnnotator:
             # Empty response (successful call but no content)
             return "", ""
             
-        except TimeoutError:
-            print(f"Request timed out after {self.timeout}s - skipping article and restarting client")
-            self._recreate_client()
-            return "", ""
-        
         except Exception as e:
             error_msg = str(e).lower()
-            # Check if it's a connection-related error
-            if any(keyword in error_msg for keyword in ['connection', 'timeout', 'broken pipe', 'reset', 'refused', 'timed out']):
+            is_timeout = isinstance(e, TimeoutError) or any(kw in error_msg for kw in ['timed out', 'timeout'])
+            is_connection = any(kw in error_msg for kw in ['connection', 'broken pipe', 'reset', 'refused'])
+
+            if is_timeout:
+                print(f"Request timed out after {self.timeout}s - restarting client")
+                words = news_content.split()
+                print(f"Failed article has {len(words)} words")
+                print(f"First 200 characters of content: {news_content[:200]}")
+                self._recreate_client()
+                # retry with longer timeout
+                try:
+                    extended_client = Client(host=self.ollama_host, timeout=self.timeout * 2)
+                    response = extended_client.chat(
+                        model=ollama_model,
+                        messages=prompt,
+                        options={
+                            'temperature': 0.0,
+                            'seed': self.seed,
+                            'num_ctx': 6144,
+                            'num_gpu': 999
+                        }
+                    )
+                    response_content = response['message']['content'].strip()
+                    if response_content:
+                        cleaned_response = self.clean_and_parse_actors(response_content)
+                        return response_content, cleaned_response
+                except Exception as retry_e:
+                    print(f"Retry after timeout also failed: {retry_e}")
+            elif is_connection:
                 print(f"Connection error: {e} - restarting client")
                 self._recreate_client()
             else:
                 print(f"Error during extraction: {e}")
             return "", ""
 
+
     def _normalize_text(self, text: str) -> str:
         """Normalize text by handling special characters and encoding issues.
         
         Handles:
         - Unicode normalization (ö, ü, ä, etc.)
-        - Mojibake/encoding artifacts
         - Extra whitespace
         """
         if not text:
             return text
-        
-        # Fix common mojibake patterns (if text was incorrectly encoded)
-        text = text.encode('latin1', errors='ignore').decode('utf-8', errors='ignore')
         
         # Normalize Unicode characters (NFC form)
         text = unicodedata.normalize('NFC', text)
@@ -280,7 +306,7 @@ class ActorAnnotator:
                 print("No valid actors after filtering (legitimate empty)")
                 return None
             
-            return json.dumps({'actors': cleaned_actors})
+            return json.dumps({'actors': cleaned_actors}, ensure_ascii=False)
             
         except Exception as e:
             print(f"Unexpected exception during parsing: {e}")
@@ -338,7 +364,7 @@ class ActorAnnotator:
             if not normalized_actors:
                 return None
             
-            return json.dumps({'actors': normalized_actors})
+            return json.dumps({'actors': normalized_actors}, ensure_ascii=False)
             
         except Exception as e:
             print(f"Fallback parser failed: {e}")
@@ -539,10 +565,10 @@ class ActorAnnotator:
         cleaned_results = []
         article_count = 0
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
-            # Recreate client every 10 articles to prevent connection/memory issues
-            if article_count > 0 and article_count % 10 == 0:
-                print(f"\n⚙ Recreating client after {article_count} articles...")
-                self._recreate_client()
+            # # Recreate client every 10 articles to prevent connection/memory issues
+            # if article_count > 0 and article_count % 10 == 0:
+            #     print(f"\n⚙ Recreating client after {article_count} articles...")
+            #     self._recreate_client()
 
             text = df_result.at[idx, 'full_text']
 
@@ -560,7 +586,7 @@ class ActorAnnotator:
 
     def chunk_dataframe(self, df: pd.DataFrame, chunk_size: int) -> List[pd.DataFrame]:
         """Split dataframe into chunks for batch processing"""
-        return [df[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+        return [df[i:i + chunk_size].copy() for i in range(0, len(df), chunk_size)]
     
     def process_articles_batch(self, df_batch: pd.DataFrame, text_column: str) -> Tuple[List[str], List[str]]:
         """Process a batch of articles and return raw and cleaned results.
@@ -620,12 +646,12 @@ class ActorAnnotator:
             print(f"\n--- Batch {batch_idx + 1}/{len(batches)} ({len(batch)} articles) ---")
             print(f"Memory: {memory_mb:.2f} MB")
             
-            # Recreate client every 50 batches
-            if batch_idx > 0 and batch_idx % 50 == 0:
-                print("⚙ Recreating client...")
-                self._recreate_client()
+            # # Recreate client every 50 batches
+            # if batch_idx > 0 and batch_idx % 50 == 0:
+            #     print("⚙ Recreating client...")
+            #     self._recreate_client()
             
-            batch = batch.reset_index(drop=True)
+            # batch = batch.reset_index(drop=True)
             
             # Process batch
             batch_results, cleaned_results = self.process_articles_batch(batch, text_column)
@@ -687,7 +713,6 @@ def load_data(data_path: str, text_column: str, title_column: str, id_column: st
     df['full_text'] = df['full_text'].str.replace(' +', ' ', regex=True)
 
     # Drop unnecessary columns to save memory
-    columns_to_keep = [id_column, 'full_text']
     df = df[[id_column, 'full_text']]
         
     return df

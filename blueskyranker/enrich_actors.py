@@ -68,6 +68,8 @@ class ActorEnricher:
         # add two parties to ideology reference data if not already present: GROENLINKS-PVDA left, and CU center
         additional_parties = pd.DataFrame([
                 {'party': 'GROENLINKS-PVDA', 'lrgen_category': 'left'},
+                {'party': 'GROENLINKS', 'lrgen_category': 'left'},
+                {'party': 'PVDA', 'lrgen_category': 'left'},
                 {'party': 'CU', 'lrgen_category': 'center'}
             ])
         self.ideology_reference_df = pd.concat([self.ideology_reference_df, additional_parties], ignore_index=True).drop_duplicates(subset=['party'], keep='first')
@@ -92,7 +94,6 @@ class ActorEnricher:
             return df
         return None
 
-    
     def _parse_actors_json(self, actors_json_str):
         if pd.isna(actors_json_str):
             return [], [], []
@@ -104,16 +105,13 @@ class ActorEnricher:
                          flags=re.IGNORECASE | re.MULTILINE
                          ).strip()
         cleaned = re.sub(r"\s+", " ", cleaned)
-
         try:
             data = json.loads(cleaned)
             actors = data.get('actors', [])
-            
             names = [actor.get('actor_name', '') for actor in actors]
             functions = [actor.get('actor_function', '') for actor in actors] 
             parties = [actor.get('actor_pp', '') for actor in actors]
             return names, functions, parties
-        
         except (json.JSONDecodeError, AttributeError):
             return [], [], []
     
@@ -139,8 +137,7 @@ class ActorEnricher:
         if self.id_column not in actor_df.columns:
             raise ValueError(
                 f"ID column '{self.id_column}' not found in DataFrame. "
-                f"Available columns: {list(actor_df.columns)}"
-            )
+                f"Available columns: {list(actor_df.columns)}")
         
         def generate_actor_rows():
             """Generator that yields actor rows one at a time."""
@@ -157,7 +154,7 @@ class ActorEnricher:
                         'actor_function': '',
                         'actor_pp': '',
                         'news_actors_raw': raw_output
-                    }
+                        }
                 else:
                     # Each actor as a separate row
                     for i in range(len(names)):
@@ -524,10 +521,11 @@ class ActorEnricher:
                                 language: str = "en") -> pd.DataFrame:
         """        
         Enrichment pipeline for politicians (function 'a', NER person):
-        1. Extract core names using NER
-        2. Match against party reference data (if available) first directly, then surname matching, then party name mentions
-        3. Query Wikidata for missing information (if use_wikidata=True)
-        4. Merge with ideology scores (if available)
+        1. Check for party name mentions in actor names (fast, direct signal)
+        2. Extract core names using NER for unmatched rows
+        3. Match against party reference data (exact → token → original name)
+        4. Query Wikidata for still-missing information (if use_wikidata=True)
+        5. Merge with ideology scores
         
         Args:
             actor_df: Optional actor-level DataFrame. If None, expands self.actor_df
@@ -551,58 +549,123 @@ class ActorEnricher:
             return pd.DataFrame()
         
         print(f"Processing {len(political_actors)} political actor records...")
-        
-        # Step 1: Extract core names using NER
-        print("Extracting core names using NER...")
-        tqdm.pandas(desc="Extracting names")
-        political_actors['core_actor_name'] = political_actors['actor_name'].progress_apply(
-            self.extract_core_name
-        )
-        
-        if political_actors.empty:
-            print("No valid person names extracted.")
-            return pd.DataFrame()
-        
-        print(f"Extracted {len(political_actors)} valid person names")
 
-        political_actors['core_actor_name_upper'] = political_actors['core_actor_name'].apply(self._normalize_string)
         political_actors['actor_name_upper'] = political_actors['actor_name'].apply(self._normalize_string)
-        self.politician_reference_df['name'] = self.politician_reference_df['name'].apply(self._normalize_string)
-        
-        # Step 2: Match against party reference data using multi-step matching strategy
         if self.politician_reference_df is not None:
-            print("Matching against politician and party reference data...")
+            self.politician_reference_df['name'] = self.politician_reference_df['name'].apply(self._normalize_string)
+        
+        # Step 1: Check for party name mentions in actor_name (before NER)
+        print("Step 1: Checking for party name mentions in actor names...")
+        political_actors['party'] = None
+        political_actors['lrgen_category'] = None
+        political_actors['matched_name'] = None
+        party_mention_count = 0
+        new_rows = []
+
+        if self.ideology_reference_df is not None:
+            for idx in political_actors.index:
+                actor_name = str(political_actors.at[idx, 'actor_name_upper']) 
+                actor_name = re.sub(r"[-–—/]", " ", actor_name)
+                actor_name = re.sub(r"\s+", " ", actor_name).strip()
+
+                matched_parties = []
+                
+                for _, ref_row in self.ideology_reference_df.iterrows():
+                    party_name_original = str(ref_row['party']).strip()  
+                    party_name_upper = self._normalize_string(party_name_original)
+                    party_name_upper = re.sub(r"[-–—/]", " ", party_name_upper)
+                    party_name_upper = re.sub(r"\s+", " ", party_name_upper).strip()
+                    
+                    pattern = rf"(?<!\w){re.escape(party_name_upper)}(?!\w)"
+
+                    if re.search(pattern, actor_name):
+                        matched_parties.append({
+                            'party': party_name_original, 
+                            'matched_name': party_name_original,
+                            'lrgen_category': ref_row['lrgen_category']
+                        })
+                
+                # For each matched party, create or update rows
+                if matched_parties:
+                    party_mention_count += 1
+                    # Update original row with first match
+                    political_actors.at[idx, 'party'] = matched_parties[0]['party']
+                    political_actors.at[idx, 'lrgen_category'] = matched_parties[0]['lrgen_category']
+                    political_actors.at[idx, 'matched_name'] = matched_parties[0]['matched_name']
+                    for match in matched_parties[1:]:
+                        row_copy = political_actors.loc[idx].copy()
+                        row_copy['party'] = match['party']
+                        row_copy['lrgen_category'] = match['lrgen_category']
+                        row_copy['matched_name'] = match['matched_name']
+                        new_rows.append(row_copy)
+
+            # Append new rows for additional matches
+            if new_rows:
+                new_rows_df = pd.DataFrame(new_rows)
+                political_actors = pd.concat([political_actors, new_rows_df], ignore_index=True)            
             
-            # Initialize columns for matched data
-            political_actors['party'] = None
-            political_actors['lrgen_category'] = None
-            political_actors['matched_name'] = None
-            
-            # Step 2.1: Exact match on core_actor_name
+        print(f". → Matched {party_mention_count} actors with party name mentions")
+
+        # Initialize column for all rows
+        political_actors['core_actor_name'] = None
+
+        unmatched_mask = political_actors['party'].isna()
+        unmatched_count = unmatched_mask.sum()
+        print(f"Step 2: Extracting core names using NER for {unmatched_count} actors with no party mentions...")
+
+        if unmatched_count > 0:
+            tqdm.pandas(desc="Extracting names")
+            ner_results = political_actors.loc[unmatched_mask, 'actor_name'].progress_apply(
+                self.extract_core_name
+            )
+            political_actors.loc[unmatched_mask, 'core_actor_name'] = ner_results
+
+        political_actors['core_actor_name_upper'] = political_actors['core_actor_name'].apply(
+            lambda x: self._normalize_string(x) if pd.notna(x) else None
+        )
+
+        # Step 2: Exact match on core_actor_name (only for rows not matched in Step 1)
+        # print("Extracting core names using NER for name matching...")
+        # tqdm.pandas(desc="Extracting names")
+        # political_actors['core_actor_name'] = political_actors['actor_name'].progress_apply(
+        #     self.extract_core_name
+        # )
+        
+        # if political_actors.empty:
+        #     print("No valid person names extracted.")
+        #     return pd.DataFrame()
+        
+        # print(f"Extracted {len(political_actors)} valid person names")
+
+        # political_actors['core_actor_name_upper'] = political_actors['core_actor_name'].apply(self._normalize_string)
+                
+        if self.politician_reference_df is not None:
             print("Step 2.1: Exact matching on core_actor_name...")
-            political_actors = political_actors.merge(
+            matched_mask = political_actors['party'].notna()
+            step1_matched_rows = matched_mask.sum()
+            matched_df = political_actors[matched_mask].copy()
+            unmatched_df = political_actors[~matched_mask].copy()
+            
+            unmatched_df = unmatched_df.merge(
                 self.politician_reference_df,
                 left_on='core_actor_name_upper',
                 right_on='name',
                 how='left',
                 suffixes=('', '_ref')
             )
-            # Move merged values into your working columns
-            political_actors['party'] = political_actors['party_ref']
-            political_actors['lrgen_category'] = political_actors['lrgen_category_ref']
-            political_actors['matched_name'] = political_actors['name']
+            unmatched_df['party'] = unmatched_df['party_ref']
+            unmatched_df['lrgen_category'] = unmatched_df['lrgen_category_ref']
+            unmatched_df['matched_name'] = unmatched_df['name']
+            unmatched_df.drop(columns=['party_ref', 'lrgen_category_ref', 'name'], inplace=True)
 
-            # Clean up helper columns
-            political_actors.drop(
-                columns=['party_ref', 'lrgen_category_ref', 'name'],
-                inplace=True
-            )
-
-            exact_count = political_actors['party'].notna().sum()
+            political_actors = pd.concat([matched_df, unmatched_df], ignore_index=True)
+                    
+            exact_count = political_actors['party'].notna().sum() - step1_matched_rows  
             print(f"  → Matched {exact_count} actors with exact core_actor_name match")
             print(f"These names are matched with reference data: {political_actors.loc[political_actors['party'].notna(), ['core_actor_name', 'matched_name']].drop_duplicates().to_dict(orient='records')}")
             
-            # Step 2.2: Token match on core_actor_name (for unmatched rows)
+        # Step 2.2: Token match on core_actor_name (for unmatched rows)
+        if self.politician_reference_df is not None:
             print("Step 2.2: Token matching on core_actor_name...")
             unmatched_mask = political_actors['party'].isna()
             token_match_count = 0
@@ -617,7 +680,7 @@ class ActorEnricher:
                         token_match_count += 1
                         break
 
-            print(f"  → Matched {token_match_count} actors with token match on core_actor_name")
+            print(f"→ Matched {token_match_count} actors with token match on core_actor_name")
             print(f"These names are matched with reference data: {political_actors.loc[political_actors['party'].notna(), ['core_actor_name', 'matched_name']].drop_duplicates().to_dict(orient='records')}")
                 
             # Step 2.3: Exact + token match on actor_name (for still unmatched rows)
@@ -636,7 +699,7 @@ class ActorEnricher:
                     actor_name_count += 1
                     continue
                 
-                # Try token match
+                # Try token match as well
                 for _, ref_row in self.politician_reference_df.iterrows():
                     if self._surname_match(actor_name, ref_row['name']):
                         political_actors.at[idx, 'party'] = ref_row['party']
@@ -645,69 +708,10 @@ class ActorEnricher:
                         actor_name_count += 1
                         break
             
-            print(f"  → Matched {actor_name_count} actors with actor_name matching")
-            
-            # Step 2.4: Check for party name mentions in actor_name or core_actor_name
-            print("Step 2.4: Checking for party name mentions...")
-            unmatched_mask = political_actors['party'].isna()
-            party_mention_count = 0
-            new_rows = []
-
-            for idx in political_actors[unmatched_mask].index:
-                actor_name = str(political_actors.at[idx, 'actor_name_upper']) # cleaned name
-                actor_name = re.sub(r"[-–—/]", " ", actor_name)
-                actor_name = re.sub(r"\s+", " ", actor_name).strip()
-
-                matched_parties = []
-                
-                for _, ref_row in self.ideology_reference_df.iterrows():
-                    party_name_original = str(ref_row['party']).strip()  # Keep original for storage
-                    party_name_upper = self._normalize_string(party_name_original)
-                    party_name_upper = re.sub(r"[-–—/]", " ", party_name_upper)
-                    party_name_upper = re.sub(r"\s+", " ", party_name_upper).strip()
-                    
-                    pattern = rf"(?<!\w){re.escape(party_name_upper)}(?!\w)"
-
-                    if re.search(pattern, actor_name):
-                        matched_parties.append({
-                            'party': party_name_original, 
-                            'matched_name': party_name_original,
-                            'lrgen_category': ref_row['lrgen_category']
-                        })
-                
-                # For each matched party, create or update rows
-                if matched_parties:
-                    party_mention_count += 1
-
-                    # Update original row with first match
-                    political_actors.at[idx, 'party'] = matched_parties[0]['party']
-                    political_actors.at[idx, 'lrgen_category'] = matched_parties[0]['lrgen_category']
-                    political_actors.at[idx, 'matched_name'] = matched_parties[0]['matched_name']
-                    
-                    # Create new rows for additional matches (starting from second match)
-                    for match in matched_parties[1:]:
-                        row_copy = political_actors.loc[idx].copy()
-                        row_copy['party'] = match['party']
-                        row_copy['lrgen_category'] = match['lrgen_category']
-                        row_copy['matched_name'] = match['matched_name']
+            print(f"→ Matched {actor_name_count} actors with actor_name matching")
                         
-                        new_rows.append(row_copy)
-
-            # Append new rows for additional matches
-            if new_rows:
-                new_rows_df = pd.DataFrame(new_rows)
-                # Deduplicate new rows
-                # new_rows_df = new_rows_df.drop_duplicates(subset=[self.id_column, 'actor_name', 'matched_name'])
-                political_actors = pd.concat([political_actors, new_rows_df], ignore_index=True)            
-            
-            print(f". → Matched {party_mention_count} actors with party name mentions")
-            
             total_matched = political_actors['party'].notna().sum()
             print(f"\nTotal matched: {total_matched} actors with reference data")
-        
-        else:
-            political_actors['party'] = None
-            political_actors['lrgen_category'] = None
 
         # Step 3: Query Wikidata for missing information
         if use_wikidata:
@@ -725,12 +729,11 @@ class ActorEnricher:
                 print(f"Querying {len(unique_missing)} unique names...")
                 
                 # Query Wikidata with progress bar
-                wikidata_results = {}
+                wikidata_results = {}                    
                 for name in tqdm(unique_missing, desc="Wikidata queries"):
-                    wikidata_results[name] = self.fetch_party_info(
-                        name, 
-                        language=language
-                    )
+                    if name is None:
+                        continue
+                    wikidata_results[name] = self.fetch_party_info(name, language=language)
                     # Small delay to avoid rate limiting
                     import time
                     time.sleep(0.1)
