@@ -642,13 +642,6 @@ class ActorAnnotator:
             print(f"\n--- Batch {batch_idx + 1}/{len(batches)} ({len(batch)} articles) ---")
             print(f"Memory: {memory_mb:.2f} MB")
             
-            # # Recreate client every 50 batches
-            # if batch_idx > 0 and batch_idx % 50 == 0:
-            #     print("⚙ Recreating client...")
-            #     self._recreate_client()
-            
-            # batch = batch.reset_index(drop=True)
-            
             # Process batch
             batch_results, cleaned_results = self.process_articles_batch(batch, text_column)
             
