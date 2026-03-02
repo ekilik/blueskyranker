@@ -565,10 +565,6 @@ class ActorAnnotator:
         cleaned_results = []
         article_count = 0
         for idx, row in tqdm(df_result.iterrows(), total=len(df_result), desc="Extracting actors"):
-            # # Recreate client every 10 articles to prevent connection/memory issues
-            # if article_count > 0 and article_count % 10 == 0:
-            #     print(f"\n⚙ Recreating client after {article_count} articles...")
-            #     self._recreate_client()
 
             text = df_result.at[idx, 'full_text']
 

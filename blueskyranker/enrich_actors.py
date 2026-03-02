@@ -66,13 +66,14 @@ class ActorEnricher:
         self.ideology_reference_df = self.political_df[['party', 'lrgen_category']].drop_duplicates() if self.political_df is not None else None
 
         # add two parties to ideology reference data if not already present: GROENLINKS-PVDA left, and CU center
-        additional_parties = pd.DataFrame([
-                {'party': 'GROENLINKS-PVDA', 'lrgen_category': 'left'},
-                {'party': 'GROENLINKS', 'lrgen_category': 'left'},
-                {'party': 'PVDA', 'lrgen_category': 'left'},
-                {'party': 'CU', 'lrgen_category': 'center'}
-            ])
-        self.ideology_reference_df = pd.concat([self.ideology_reference_df, additional_parties], ignore_index=True).drop_duplicates(subset=['party'], keep='first')
+        if self.language == 'nl' and self.ideology_reference_df is not None:
+            additional_parties = pd.DataFrame([
+                    {'party': 'GROENLINKS-PVDA', 'lrgen_category': 'left'},
+                    {'party': 'GROENLINKS', 'lrgen_category': 'left'},
+                    {'party': 'PVDA', 'lrgen_category': 'left'},
+                    {'party': 'CU', 'lrgen_category': 'center'}
+                ])
+            self.ideology_reference_df = pd.concat([self.ideology_reference_df, additional_parties], ignore_index=True).drop_duplicates(subset=['party'], keep='first')
 
     def _load_actor_data(self) -> pd.DataFrame:
             """Load actor data from CSV file into a DataFrame"""

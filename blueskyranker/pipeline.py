@@ -77,6 +77,7 @@ def run_fetch_rank_push(
     descending: bool = True,
     demote_last: bool = True,
     demote_window_hours: int = 48,
+    actor_diversity: bool = False,
     # Push options
     test: bool = True,
     dry_run: bool = False,
@@ -144,6 +145,7 @@ def run_fetch_rank_push(
             include_pins=include_pins,
             sqlite_path=sqlite_path,
             refresh_window=True,
+            extract_articles=actor_diversity,
         )
     # Phase B: ensure clustering context is available out to cluster_days without re-refreshing older rows
     if cluster_days is not None and (refresh_days is None or int(cluster_days) > int(refresh_days)):
@@ -154,6 +156,7 @@ def run_fetch_rank_push(
             include_pins=include_pins,
             sqlite_path=sqlite_path,
             refresh_window=False,
+            extract_articles=actor_diversity,
         )
 
     db_path = sqlite_path or DEFAULT_SQLITE_PATH
@@ -617,6 +620,8 @@ def main():
     p.add_argument('--quiet-dry-run', dest='dry_run_verbose', action='store_false', help='Suppress console summary when using --dry-run')
     p.add_argument('--dry-run-verbose', dest='dry_run_verbose', action='store_true', help='Show detailed dry-run summary (default)')
     p.add_argument('--log-path', default='push.log')
+    p.add_argument('--actor-diversity', dest='actor_diversity', action='store_true', default=False,
+                   help='Enable actor diversity ranking; also enables full article extraction.')
     p.set_defaults(dry_run_verbose=True)
 
     args = p.parse_args()
@@ -641,6 +646,7 @@ def main():
         descending=args.descending,
         demote_last=args.demote_last,
         demote_window_hours=args.demote_window_hours,
+        actor_diversity=args.actor_diversity,
         test=args.test,
         dry_run=args.dry_run,
         log_path=args.log_path,
