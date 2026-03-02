@@ -95,6 +95,7 @@ setuptools==80.9.0
 six==1.17.0
 sniffio==1.3.1
 spacy==3.8.7
+SPARQLWrapper==2.0.0
 stack-data==0.6.3
 sympy==1.14.0
 texttable==1.7.0
@@ -110,6 +111,8 @@ triton==3.4.0
 typing-inspection==0.4.1
 typing_extensions==4.14.1
 tzdata==2025.2
+ollama==0.6.0
+stanza==1.11.0
 urllib3==2.5.0
 wcwidth==0.2.13
 websockets==13.1
