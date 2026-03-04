@@ -625,21 +625,6 @@ class ActorEnricher:
             lambda x: self._normalize_string(x) if pd.notna(x) else None
         )
 
-        # Step 2: Exact match on core_actor_name (only for rows not matched in Step 1)
-        # print("Extracting core names using NER for name matching...")
-        # tqdm.pandas(desc="Extracting names")
-        # political_actors['core_actor_name'] = political_actors['actor_name'].progress_apply(
-        #     self.extract_core_name
-        # )
-        
-        # if political_actors.empty:
-        #     print("No valid person names extracted.")
-        #     return pd.DataFrame()
-        
-        # print(f"Extracted {len(political_actors)} valid person names")
-
-        # political_actors['core_actor_name_upper'] = political_actors['core_actor_name'].apply(self._normalize_string)
-                
         if self.politician_reference_df is not None:
             print("Step 2.1: Exact matching on core_actor_name...")
             matched_mask = political_actors['party'].notna()
