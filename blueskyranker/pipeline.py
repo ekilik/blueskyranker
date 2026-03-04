@@ -24,6 +24,7 @@ import polars as pl
 
 from .fetcher import Fetcher, ensure_db, load_posts_df, DEFAULT_SQLITE_PATH
 from .ranker import TopicRanker
+from .actor_annotator import ActorAnnotator
 
 import logging
 
@@ -78,6 +79,12 @@ def run_fetch_rank_push(
     demote_last: bool = True,
     demote_window_hours: int = 48,
     actor_diversity: bool = False,
+    # Actor annotator options (used when actor_diversity=True)
+    annotator_model: str = "gpt-oss:20b",
+    annotator_batch_size: int = 10,
+    annotator_ollama_host: str = "http://localhost:11434",
+    annotator_timeout: int = 120,
+    annotator_lookback_hours: int = 24,
     # Push options
     test: bool = True,
     dry_run: bool = False,
@@ -214,6 +221,17 @@ def run_fetch_rank_push(
         except Exception:
             return set()
 
+    annotator = None
+    if actor_diversity:
+        try:
+            annotator = ActorAnnotator(
+                model_name=annotator_model,
+                ollama_host=annotator_ollama_host,
+                timeout=annotator_timeout,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialise ActorAnnotator: {e}. Actor annotation will be skipped.")
+
     for h in handles:
         df = load_posts_df(conn, handle=h, order_by='createdAt', descending=False)
         if df.is_empty():
@@ -228,6 +246,49 @@ def run_fetch_rank_push(
                 )
             except Exception:
                 df = df.with_columns(pl.col('createdAt').alias('createdAt_dt'))
+
+        if annotator is not None and 'news_content' in df.columns:
+            safe_h = h.replace('.', '_')
+
+            # Collect URIs already annotated within the lookback window
+            annotated_uris: set[str] = set()
+            lookback_cutoff = datetime.now(timezone.utc) - timedelta(hours=annotator_lookback_hours)
+            for pf in sorted(Path('actor_annotation_batches').glob(f"{safe_h}_*/batch_*.parquet")):
+                try:
+                    mtime = datetime.fromtimestamp(pf.stat().st_mtime, tz=timezone.utc)
+                    if mtime >= lookback_cutoff:
+                        annotated_uris.update(pl.read_parquet(pf, columns=['uri'])['uri'].to_list())
+                        print(f"Loaded {len(annotated_uris)} annotated URIs from {pf} (modified {mtime.isoformat()})")
+                except Exception:
+                    pass
+
+            # Only annotate articles with sufficient content whose URI hasn't been seen yet
+            df_to_annotate = df.filter(
+                pl.col('news_content').is_not_null()
+                & (pl.col('news_content').str.strip_chars().str.len_chars() >= 50)
+                & ~pl.col('uri').is_in(annotated_uris)
+            )
+            n_skip = len(df) - len(df_to_annotate)
+            if n_skip:
+                logger.info(f"{h}: {n_skip} articles already annotated within lookback window, skipping")
+
+            if df_to_annotate.is_empty():
+                logger.info(f"{h}: no new articles to annotate")
+            else:
+                ann_run_id = f"{safe_h}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+                logger.info(f"Annotating {len(df_to_annotate)} new articles for {h} (run_id={ann_run_id})")
+                try:
+                    _, ann_run_id = annotator.process_all_batches(
+                        df_to_annotate,
+                        batch_size=annotator_batch_size,
+                        text_column='news_content',
+                        title_column='news_title',
+                        output_dir='actor_annotation_batches',
+                        run_id=ann_run_id,
+                    )
+                    logger.info(f"Actor annotation complete → actor_annotation_batches/{ann_run_id}/")
+                except Exception as e:
+                    logger.error(f"Actor annotation failed for {h}: {e}. Continuing without annotations.")
 
         ranker = TopicRanker(
             returnformat='dataframe',
@@ -622,6 +683,16 @@ def main():
     p.add_argument('--log-path', default='push.log')
     p.add_argument('--actor-diversity', dest='actor_diversity', action='store_true', default=False,
                    help='Enable actor diversity ranking; also enables full article extraction.')
+    p.add_argument('--annotator-model', dest='annotator_model', default='gpt-oss:20b',
+                   help='Ollama model name for actor annotation (default: gpt-oss:20b)')
+    p.add_argument('--annotator-batch-size', dest='annotator_batch_size', type=int, default=10,
+                   help='Number of articles per annotation batch (default: 10)')
+    p.add_argument('--annotator-ollama-host', dest='annotator_ollama_host', default='http://localhost:11434',
+                   help='Ollama server URL for actor annotation (default: http://localhost:11434)')
+    p.add_argument('--annotator-timeout', dest='annotator_timeout', type=int, default=120,
+                   help='Per-request timeout in seconds for actor annotation (default: 120)')
+    p.add_argument('--annotator-lookback-hours', dest='annotator_lookback_hours', type=int, default=24,
+                   help='Skip articles already annotated within this many hours (default: 24)')
     p.set_defaults(dry_run_verbose=True)
 
     args = p.parse_args()
@@ -647,6 +718,11 @@ def main():
         demote_last=args.demote_last,
         demote_window_hours=args.demote_window_hours,
         actor_diversity=args.actor_diversity,
+        annotator_model=args.annotator_model,
+        annotator_batch_size=args.annotator_batch_size,
+        annotator_ollama_host=args.annotator_ollama_host,
+        annotator_timeout=args.annotator_timeout,
+        annotator_lookback_hours=args.annotator_lookback_hours,
         test=args.test,
         dry_run=args.dry_run,
         log_path=args.log_path,
