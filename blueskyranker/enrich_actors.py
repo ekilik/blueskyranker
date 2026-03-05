@@ -23,10 +23,9 @@ class ActorEnricher:
             self,
             actor_data_path: Optional[str] = None,
             actor_df: Optional[pl.DataFrame] = None,
-            id_column: str = 'news_id',
+            id_column: str = 'uri',
             language: str = 'en',
             center_parties: bool = True,
-            save_politicians_df: bool = False,
             political_data_path: Optional[str] = None):
 
         """
@@ -38,7 +37,6 @@ class ActorEnricher:
             id_column: Name of the column containing unique article identifiers
             language: Language for NER processing ('en', 'nl', etc.)
             center_parties: Whether the country has center parties in addition to left and right
-            save_politicians_df: Whether to save enriched political actors to _political.csv file
             political_data_path: Path to CSV with party reference data (columns: name, party, lrgen_category)
         """
 
@@ -46,7 +44,6 @@ class ActorEnricher:
         self.id_column = id_column
         self.language = language
         self.center_parties = center_parties
-        self.save_politicians_df = save_politicians_df
 
         # Load actor data
         self.actor_df = actor_df if actor_df is not None else self._load_actor_data()
@@ -877,11 +874,10 @@ def main(args):
         id_column=args.id_column,
         language=args.language,
         political_data_path=args.political_data_path,
-        save_politicians_df=args.save_politicians_df
     )
 
     # Run full enrichment pipeline
-    expanded_df, functions_df, enriched_political_df, ideology_df = enricher.run_full_enrichment(
+    expanded_df, functions_df, _, ideology_df = enricher.run_full_enrichment(
         use_wikidata=args.use_wikidata,
         language=args.language
     )
@@ -899,12 +895,6 @@ def main(args):
     functions_path = f"{args.output_prefix}_functions.csv"
     functions_df.write_csv(functions_path, separator=';')
     print(f"Saved function statistics to: {functions_path}")
-
-    # Save enriched political actors
-    if enricher.save_politicians_df:
-        political_path = f"{args.output_prefix}_political.csv"
-        enriched_political_df.write_csv(political_path, separator=';')
-        print(f"Saved enriched political actors to: {political_path}")
 
     # Save ideology statistics
     ideology_path = f"{args.output_prefix}_ideology.csv"
@@ -933,8 +923,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--id_column",
         type=str,
-        default="news_id",
-        help="Column name for unique article identifier (default: 'news_id')"
+        default="uri",
+        help="Column name for unique article identifier (default: 'uri')"
     )
 
     # Language and processing arguments
@@ -954,12 +944,6 @@ if __name__ == "__main__":
         "--political_data_path",
         type=str,
         help="Path to CSV with party reference data (columns: name, party, lrgen_category)"
-    )
-
-    parser.add_argument(
-        "--save_politicians_df",
-        action="store_true",
-        help="Save updated politician reference data to file after Wikidata queries"
     )
 
     args = parser.parse_args()

@@ -121,7 +121,9 @@ class ActorAnnotator:
         ]
         return messages
 
-    def extract_actors_from_content(self, news_content: str, ollama_model: str = None) -> Tuple[str, str]:
+    def extract_actors_from_content(self, 
+                                    news_content: str, 
+                                    ollama_model: str = None) -> Tuple[str, str]:
         """Extract raw LLM response from news content using Ollama.
         Uses Ollama's built-in timeout through client, restarts client after timeout.
         Has a pre-set num_ctx value to handle longer articles, can be adapted if needed.
@@ -529,11 +531,11 @@ class ActorAnnotator:
     def process_all_batches(self,
                             df: pl.DataFrame,
                             batch_size: int,
-                            text_column: str,
+                            text_column: str = "news_content", 
                             start_batch: int = 0,
                             output_dir: str = "actor_annotation_batches",
                             run_id: Optional[str] = None,
-                            title_column: Optional[str] = None) -> Tuple[pl.DataFrame, str]:
+                            title_column: Optional[str] = "news_title") -> Tuple[pl.DataFrame, str]:
         """Process all batches with memory management, return annotated Polars DataFrame.
 
         Saves each completed batch immediately to disk as Parquet, mirroring the
