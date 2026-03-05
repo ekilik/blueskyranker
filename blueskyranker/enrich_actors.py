@@ -4,7 +4,7 @@ import re
 import unicodedata
 import os
 import argparse
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import stanza
 from tqdm import tqdm
 
@@ -26,7 +26,7 @@ class ActorEnricher:
             id_column: str = 'uri',
             language: str = 'en',
             center_parties: bool = True,
-            political_data_path: Optional[str] = None):
+            politicians_data_path: Optional[str] = None):
 
         """
         Initialize ActorEnricher.
@@ -37,7 +37,7 @@ class ActorEnricher:
             id_column: Name of the column containing unique article identifiers
             language: Language for NER processing ('en', 'nl', etc.)
             center_parties: Whether the country has center parties in addition to left and right
-            political_data_path: Path to CSV with party reference data (columns: name, party, lrgen_category)
+            politicians_data_path: Path to CSV with party reference data (columns: name, party, lrgen_category)
         """
 
         self.actor_data_path = actor_data_path
@@ -57,7 +57,7 @@ class ActorEnricher:
         )
 
         # Load reference data as lists of dicts for efficient iteration
-        _political_df = self._load_political_data(political_data_path)
+        _political_df = self._load_politicians_data(politicians_data_path)
         if _political_df is not None:
             self.politician_reference_df: Optional[List[Dict]] = (
                 _political_df.select(['name', 'party', 'lrgen_category'])
@@ -91,7 +91,7 @@ class ActorEnricher:
             else:
                 raise ValueError("No actor data path provided and no DataFrame was passed.")
 
-    def _load_political_data(self, path: Optional[str]) -> Optional[pl.DataFrame]:
+    def _load_politicians_data(self, path: Optional[str]) -> Optional[pl.DataFrame]:
         """Load party reference data for matching."""
         if path and os.path.exists(path):
             print(f"Loading party reference data from {path}")
@@ -100,10 +100,9 @@ class ActorEnricher:
         return None
 
     def _parse_actors_json(self, actors_json_str):
+        """Parse the JSON string and extract actor lists"""
         if actors_json_str is None:
             return [], [], []
-
-        """Parse the JSON string and extract actor lists"""
         cleaned = re.sub(r"\s+", " ", actors_json_str)
         cleaned = re.sub(r"^```(?:json)?|```$", "",
                          cleaned,
@@ -812,7 +811,7 @@ class ActorEnricher:
         self,
         use_wikidata: bool = True,
         language: str = "en"
-    ) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    ) -> pl.DataFrame:
         """
         Run the complete enrichment pipeline.
 
@@ -821,11 +820,9 @@ class ActorEnricher:
             language: Language code for Wikidata queries
 
         Returns:
-            Tuple of (expanded_df, functions_df, enriched_political_df, ideology_df)
-            - expanded_df: All actors at row level
-            - functions_df: Actor count statistics per function per article
-            - enriched_political_df: Political actors with party and ideology info
-            - ideology_df: Actor count statistics per ideology per article
+            DataFrame with columns: id_column, nr_actors_a, nr_actors_b, nr_actors_c,
+            nr_actors_d, nr_actors_total, nr_actors_left, nr_actors_right,
+            nr_actors_center (if center_parties=True), nr_actors_political
         """
         print("\n" + "="*60)
         print("STARTING FULL ACTOR ENRICHMENT PIPELINE")
@@ -862,7 +859,11 @@ class ActorEnricher:
         print("ENRICHMENT PIPELINE COMPLETED")
         print("="*60 + "\n")
 
-        return expanded_df, functions_df, enriched_political_df, ideology_df
+        if functions_df.is_empty():
+            return ideology_df
+        if ideology_df.is_empty():
+            return functions_df
+        return functions_df.join(ideology_df, on=self.id_column, how='left')
 
 
 def main(args):
@@ -873,11 +874,11 @@ def main(args):
         actor_data_path=args.actor_data_path,
         id_column=args.id_column,
         language=args.language,
-        political_data_path=args.political_data_path,
+        politicians_data_path=args.politicians_data_path,
     )
 
     # Run full enrichment pipeline
-    expanded_df, functions_df, _, ideology_df = enricher.run_full_enrichment(
+    actor_stats_df = enricher.run_full_enrichment(
         use_wikidata=args.use_wikidata,
         language=args.language
     )
@@ -886,20 +887,10 @@ def main(args):
     output_dir = os.path.dirname(args.output_prefix) or '.'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save expanded actors
-    expanded_path = f"{args.output_prefix}_expanded.csv"
-    expanded_df.write_csv(expanded_path, separator=';')
-    print(f"Saved expanded actors to: {expanded_path}")
-
-    # Save function statistics
-    functions_path = f"{args.output_prefix}_functions.csv"
-    functions_df.write_csv(functions_path, separator=';')
-    print(f"Saved function statistics to: {functions_path}")
-
-    # Save ideology statistics
-    ideology_path = f"{args.output_prefix}_ideology.csv"
-    ideology_df.write_csv(ideology_path, separator=';')
-    print(f"Saved ideology statistics to: {ideology_path}")
+    # Save actor statistics
+    stats_path = f"{args.output_prefix}_actor_stats.csv"
+    actor_stats_df.write_csv(stats_path, separator=';')
+    print(f"Saved actor statistics to: {stats_path}")
 
 
 if __name__ == "__main__":
@@ -941,7 +932,7 @@ if __name__ == "__main__":
     )
     # Reference data arguments
     parser.add_argument(
-        "--political_data_path",
+        "--politicians_data_path",
         type=str,
         help="Path to CSV with party reference data (columns: name, party, lrgen_category)"
     )
