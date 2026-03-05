@@ -482,6 +482,9 @@ class ActorAnnotator:
             print("Model not available, exiting.")
             return df
 
+        if not isinstance(df, pl.DataFrame):
+            df = pl.DataFrame(df.to_dict(orient='list'))
+
         # Build full_text: title + newline + article text, then clean whitespace
         full_text_series = (
             df[title_column].fill_null('').cast(pl.Utf8) + '\n' +
@@ -503,8 +506,8 @@ class ActorAnnotator:
             time.sleep(0.1)
 
         return df_result.with_columns([
-            pl.Series('news_actors', results),
-            pl.Series('raw_response', cleaned_results),
+            pl.Series('news_actors_raw', results),
+            pl.Series('news_actors', cleaned_results),
         ])
 
     def chunk_dataframe(self, df: pl.DataFrame, chunk_size: int) -> List[pl.DataFrame]:
