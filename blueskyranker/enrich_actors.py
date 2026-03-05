@@ -917,8 +917,6 @@ if __name__ == "__main__":
         default="uri",
         help="Column name for unique article identifier (default: 'uri')"
     )
-
-    # Language and processing arguments
     parser.add_argument(
         "--language",
         type=str,
@@ -930,7 +928,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Query Wikidata for missing party information"
     )
-    # Reference data arguments
     parser.add_argument(
         "--politicians_data_path",
         type=str,
