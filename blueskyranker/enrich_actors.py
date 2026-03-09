@@ -810,7 +810,8 @@ class ActorEnricher:
     def run_full_enrichment(
         self,
         use_wikidata: bool = True,
-        language: str = "en"
+        language: str = "en",
+        actor_df: Optional[pl.DataFrame] = None,
     ) -> pl.DataFrame:
         """
         Run the complete enrichment pipeline.
@@ -830,7 +831,7 @@ class ActorEnricher:
 
         # Step 1: Expand actors to rows
         print("Step 1: Expanding actors to row-level...")
-        expanded_df = self.expand_actors_to_rows()
+        expanded_df = self.expand_actors_to_rows(actor_df)
         print(f"Expanded to {len(expanded_df)} actor records\n")
 
         # Step 2: Calculate actor statistics per function
