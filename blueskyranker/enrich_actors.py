@@ -810,7 +810,7 @@ class ActorEnricher:
     def run_full_enrichment(
         self,
         use_wikidata: bool = True,
-        language: str = "en",
+        language: Optional[str] = None,
         actor_df: Optional[pl.DataFrame] = None,
     ) -> pl.DataFrame:
         """
@@ -818,13 +818,14 @@ class ActorEnricher:
 
         Args:
             use_wikidata: Whether to query Wikidata for party information
-            language: Language code for Wikidata queries
+            language: Language code for Wikidata queries (defaults to the language set at init)
 
         Returns:
             DataFrame with columns: id_column, nr_actors_a, nr_actors_b, nr_actors_c,
             nr_actors_d, nr_actors_total, nr_actors_left, nr_actors_right,
             nr_actors_center (if center_parties=True), nr_actors_political
         """
+        language = language or self.language
         print("\n" + "="*60)
         print("STARTING FULL ACTOR ENRICHMENT PIPELINE")
         print("="*60 + "\n")
