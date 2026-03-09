@@ -25,6 +25,7 @@ import polars as pl
 from .fetcher import Fetcher, ensure_db, load_posts_df, DEFAULT_SQLITE_PATH
 from .ranker import TopicRanker
 from .actor_annotator import ActorAnnotator
+from .enrich_actors import ActorEnricher
 
 import logging
 
@@ -85,6 +86,11 @@ def run_fetch_rank_push(
     annotator_ollama_host: str = "http://localhost:11434",
     annotator_timeout: int = 120,
     annotator_lookback_hours: int = 24,
+    # Actor enricher options (used when actor_diversity=True)
+    enricher_language: str = 'nl',
+    enricher_politicians_data_path: Optional[str] = None,
+    enricher_center_parties: bool = True,
+    enricher_use_wikidata: bool = True,
     # Push options
     test: bool = True,
     dry_run: bool = False,
@@ -233,6 +239,7 @@ def run_fetch_rank_push(
             logger.error(f"Failed to initialise ActorAnnotator: {e}. Actor annotation will be skipped.")
 
     for h in handles:
+        
         df = load_posts_df(conn, handle=h, order_by='createdAt', descending=False)
         if df.is_empty():
             logger.info(f"No rows for {h}; skipping push")
@@ -289,6 +296,30 @@ def run_fetch_rank_push(
                     logger.info(f"Actor annotation complete → actor_annotation_batches/{ann_run_id}/")
                 except Exception as e:
                     logger.error(f"Actor annotation failed for {h}: {e}. Continuing without annotations.")
+
+            # Run actor enrichment on all annotation parquets for this handle
+            if actor_diversity:
+                ann_files = sorted(Path('actor_annotation_batches').glob(f"{safe_h}_*/batch_*.parquet"))
+                if ann_files:
+                    try:
+                        ann_df = pl.concat([pl.read_parquet(f) for f in ann_files])
+                        enricher = ActorEnricher(
+                            actor_df=ann_df,
+                            language=enricher_language,
+                            politicians_data_path=enricher_politicians_data_path,
+                            center_parties=enricher_center_parties,
+                        )
+                        actor_stats = enricher.run_full_enrichment(
+                            use_wikidata=enricher_use_wikidata,
+                            language=enricher_language,
+                        )
+                        enrich_out = Path('actor_annotation_batches') / f"{safe_h}_enriched.parquet"
+                        actor_stats.write_parquet(enrich_out)
+                        logger.info(f"Actor enrichment complete → {enrich_out}")
+                    except Exception as e:
+                        logger.error(f"Actor enrichment failed for {h}: {e}. Continuing without enrichment.")
+                else:
+                    logger.info(f"{h}: no annotation files found, skipping enrichment")
 
         ranker = TopicRanker(
             returnformat='dataframe',
@@ -693,7 +724,16 @@ def main():
                    help='Per-request timeout in seconds for actor annotation (default: 120)')
     p.add_argument('--annotator-lookback-hours', dest='annotator_lookback_hours', type=int, default=24,
                    help='Skip articles already annotated within this many hours (default: 24)')
+    p.add_argument('--enricher-language', dest='enricher_language', default='nl',
+                   help='Language for NER in actor enrichment (default: nl)')
+    p.add_argument('--enricher-politicians-data-path', dest='enricher_politicians_data_path', default=None,
+                   help='Path to CSV with politician reference data (name, party, lrgen_category)')
+    p.add_argument('--enricher-center-parties', dest='enricher_center_parties', action='store_true', default=True,
+                   help='Include center parties in ideology stats (default: True)')
+    p.add_argument('--enricher-use-wikidata', dest='enricher_use_wikidata', action='store_true', default=False,
+                   help='Query Wikidata for missing party info during enrichment (default: False)')
     p.set_defaults(dry_run_verbose=True)
+    
 
     args = p.parse_args()
 
@@ -723,6 +763,10 @@ def main():
         annotator_ollama_host=args.annotator_ollama_host,
         annotator_timeout=args.annotator_timeout,
         annotator_lookback_hours=args.annotator_lookback_hours,
+        enricher_language=args.enricher_language,
+        enricher_politicians_data_path=args.enricher_politicians_data_path,
+        enricher_center_parties=args.enricher_center_parties,
+        enricher_use_wikidata=args.enricher_use_wikidata,
         test=args.test,
         dry_run=args.dry_run,
         log_path=args.log_path,
