@@ -36,9 +36,9 @@ STEP 4: Merge multiple references to the same actor into one entry (if applicabl
 
 2. Actor Function (Choose the category that fits the function of the news actor, a/b/c or d):
 - a. Government and politics: e.g. politicians, government/state officials, law enforcement, judiciary, military
-- b. Professionals and experts: e.g. academics, researchers, businesses and business representatives, lawyers, celebrities, experts
-- c. Civil society organizations: e.g. non-governmental organizations, grasroots organizations, non-profit organizations, unions, activist groups, interest groups, think thanks, other types of civil society organizations
-- d. Citizens/members of the public: e.g. e.g., ordinary citizens, residents, protesters, community members, people speaking from personal experience, public opinion
+- b. Professionals and experts: e.g. academics, researchers, businesses and business representatives, lawyers, celebrities, experts, news and media organizations
+- c. Civil society organizations: e.g. non-governmental organizations, grasroots organizations, non-profit organizations, unions, activist groups, interest groups, think thanks
+- d. Citizens/members of the public: e.g. ordinary citizens, residents, protesters, community members, people speaking from personal experience, public opinion
 
 3. Political Party (Only if function = Government and politics):
 - Copy-paste exact party reference from article
