@@ -176,8 +176,6 @@ class ActorAnnotator:
             if is_timeout:
                 print(f"Request timed out after {self.timeout}s - restarting client")
                 words = news_content.split()
-                print(f"Failed article has {len(words)} words")
-                print(f"First 200 characters of content: {news_content[:200]}")
                 self._recreate_client()
                 # retry with longer timeout
                 try:
@@ -225,18 +223,15 @@ class ActorAnnotator:
             actors_pattern = r'"?actors"?\s*:\s*\[(.*)\]'
             actors_match = re.search(actors_pattern, cleaned, re.DOTALL | re.IGNORECASE)
             if not actors_match:
-                print("No actors array pattern found in LLM response")
                 return None
             
             actors_content = actors_match.group(1).strip()
             if not actors_content:
-                print("Empty actors array found")
                 return None
             
             try:
                 actors_list = json.loads(f"[{actors_content}]")
             except json.JSONDecodeError:
-                print("Direct JSON parsing failed, trying pattern extraction")
                 actors_list = self._extract_actor_json_from_output(actors_content)
 
             if actors_list:
@@ -249,7 +244,6 @@ class ActorAnnotator:
                     for actor in actors_list if isinstance(actor, dict)
                 )
                 if not has_standard_fields and has_alternative_fields:
-                    print("Actors use alternative field names - trying fallback")
                     return self._fallback_llm_output_cleaner(llm_response)
 
             cleaned_actors = []
@@ -264,21 +258,15 @@ class ActorAnnotator:
                         cleaned_actors.append(cleaned_actor)
 
             if not cleaned_actors:
-                print("No valid actors after filtering (legitimate empty)")
                 return None
             
             return json.dumps({'actors': cleaned_actors}, ensure_ascii=False)
 
         except Exception as e:
-            print(f"Unexpected exception during parsing: {e}")
             if len(llm_response.strip()) > 20:
-                print("Trying fallback due to exception")
-                try:
-                    fallback_result = self._fallback_llm_output_cleaner(llm_response)
-                    if fallback_result:
-                        return fallback_result
-                except Exception as fe:
-                    print(f"Fallback parser also failed: {fe}")
+                fallback_result = self._fallback_llm_output_cleaner(llm_response)
+                if fallback_result:
+                    return fallback_result            
             return None
 
     def _fallback_llm_output_cleaner(self, llm_response: str) -> Optional[str]:
