@@ -41,6 +41,7 @@ class ActorEnricher:
         """
 
         self.actor_data_path = actor_data_path
+        self.politicians_data_path = politicians_data_path
         self.id_column = id_column
         self.language = language
         self.center_parties = center_parties
@@ -558,8 +559,8 @@ class ActorEnricher:
             for ref_row in self.politician_reference_df:
                 ref_row['name'] = self._normalize_string(ref_row['name'])
 
-        # Step 1: Check for party name mentions in actor_name (before NER)
-        print("Step 1: Checking for party name mentions in actor names...")
+        # Step 3.1: Check for party name mentions in actor_name (before NER)
+        print("Step 3.1: Checking for party name mentions in actor names...")
         party_mention_count = 0
         extra_rows: List[Dict] = []
 
@@ -604,7 +605,7 @@ class ActorEnricher:
         print(f". → Matched {party_mention_count} actors with party name mentions")
 
         unmatched = [row for row in political_actors if row['party'] is None]
-        print(f"Step 2: Extracting core names using NER for {len(unmatched)} actors with no party mentions...")
+        print(f"Step 3.2: Extracting core names using NER for {len(unmatched)} actors with no party mentions...")
 
         for row in tqdm(unmatched, desc="Extracting names"):
             row['core_actor_name'] = self.extract_core_name(row['actor_name'])
@@ -614,7 +615,7 @@ class ActorEnricher:
             row['core_actor_name_upper'] = self._normalize_string(cn) if cn is not None else None
 
         if self.politician_reference_df is not None:
-            print("Step 2.1: Exact matching on core_actor_name...")
+            print("Step 3.3: Exact matching on core_actor_name...")
             step1_matched = sum(1 for row in political_actors if row['party'] is not None)
 
             # Build lookup dict for O(1) exact matching
@@ -636,11 +637,10 @@ class ActorEnricher:
                 if r['party'] is not None and r['core_actor_name'] not in seen:
                     seen.add(r['core_actor_name'])
                     unique_matched.append({'core_actor_name': r['core_actor_name'], 'matched_name': r['matched_name']})
-            print(f"These names are matched with reference data: {unique_matched}")
 
-        # Step 2.2: Token match on core_actor_name (for unmatched rows)
+        # Step 3.4: Token match on core_actor_name (for unmatched rows)
         if self.politician_reference_df is not None:
-            print("Step 2.2: Token matching on core_actor_name...")
+            print("Step 3.4: Token matching on core_actor_name...")
             token_match_count = 0
 
             for row in political_actors:
@@ -662,8 +662,8 @@ class ActorEnricher:
                     unique_matched2.append({'core_actor_name': r['core_actor_name'], 'matched_name': r['matched_name']})
             print(f"These names are matched with reference data: {unique_matched2}")
 
-            # Step 2.3: Exact + token match on actor_name (for still unmatched rows)
-            print("Step 2.3: Matching on original actor_name...")
+            # Step 3.5: Exact + token match on actor_name (for still unmatched rows)
+            print("Step 3.5: Matching on original actor_name...")
             actor_name_count = 0
 
             for row in political_actors:
@@ -695,7 +695,7 @@ class ActorEnricher:
             missing = [row for row in political_actors if row['party'] is None]
 
             if missing:
-                print(f"Querying Wikidata for {len(missing)} actors with missing party info...")
+                print(f"Step 3.6: Querying Wikidata for {len(missing)} actors with missing party info...")
 
                 unique_names = list({row['core_actor_name'] for row in missing if row['core_actor_name'] is not None})
                 print(f"Querying {len(unique_names)} unique names...")
@@ -727,21 +727,47 @@ class ActorEnricher:
 
                 # Add wikidata results to the party reference list for future use
                 print("Updating party reference data with Wikidata results...")
-                if self.politician_reference_df is not None:
+                if self.politician_reference_df is not None and self.ideology_reference_df is not None:
                     existing_names = {ref['name'] for ref in self.politician_reference_df}
-                    for name, result in wikidata_results.items():
-                        if name not in existing_names:
-                            self.politician_reference_df.append({
-                                'name': name,
-                                'party': result.get('party_name_short'),
-                                'lrgen_category': result.get('lrgen_category'),
-                            })
 
-                # Save updated politician reference data if path is set
-                if self.actor_data_path is not None:
-                    politician_ref_path = os.path.splitext(self.actor_data_path)[0] + '_politicians_updated.csv'
+                    ideology_lookup = {
+                        self._normalize_string(ref['party']): ref['lrgen_category']
+                        for ref in self.ideology_reference_df
+                        if ref.get('party') is not None and ref.get('lrgen_category') is not None
+                    }
+
+                    for name, result in wikidata_results.items():
+                        if name in existing_names:
+                            continue
+
+                        party_short = result.get('party_name_short')
+                        if not party_short:
+                            continue
+                        
+                        name_clean = self._normalize_string(name)
+                        party_clean = self._normalize_string(party_short)
+                        lrgen = ideology_lookup.get(party_clean)
+                        if lrgen is None:
+                            continue
+
+                        self.politician_reference_df.append({
+                            'name': name_clean,
+                            'party': party_clean,
+                            'lrgen_category': lrgen,
+                        })
+
+                # Save updated politician reference data for manual check
+                if self.politicians_data_path is not None and self.politician_reference_df is not None:
+                    base_dir = os.path.dirname(self.politicians_data_path) or "."
+                    politician_ref_path = os.path.join(
+                        base_dir,
+                        f"politicians_{self.language}_updated.csv"
+                    )
                     print(f"Writing updated politician reference data to {politician_ref_path}...")
-                    pl.DataFrame(self.politician_reference_df).write_csv(politician_ref_path, separator=';')
+                    pl.DataFrame(self.politician_reference_df).write_csv(
+                        politician_ref_path,
+                        separator=';'
+                    )
 
         # drop if lrgen_category is missing
         political_actors = [row for row in political_actors if row.get('lrgen_category') is not None]
