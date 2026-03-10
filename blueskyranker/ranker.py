@@ -408,7 +408,6 @@ class TopicRanker(_BaseRanker):
         self._last_sbert_model_name = None
         if similarity =='tfidf-cosine':
             vectorizer = TfidfVectorizer(stop_words=self.stopwords)
-            # self._last_sbert_model_name = model_name
             texts = data['text'].fill_null('').to_list()
             bow = vectorizer.fit_transform(texts)
             sim_matrix = cosine_similarity(bow)
