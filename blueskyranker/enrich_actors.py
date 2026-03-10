@@ -744,7 +744,7 @@ class ActorEnricher:
                         if not party_short:
                             continue
                         
-                        name_clean = self._normalize_string(name)
+                        name_clean = name.strip() if name else None
                         party_clean = self._normalize_string(party_short)
                         lrgen = ideology_lookup.get(party_clean)
                         if lrgen is None:
@@ -756,8 +756,6 @@ class ActorEnricher:
                             'lrgen_category': lrgen,
                         })
 
-                # Save updated politician reference data for manual check
-                if self.politicians_data_path is not None and self.politician_reference_df is not None:
                     base_dir = os.path.dirname(self.politicians_data_path) or "."
                     politician_ref_path = os.path.join(
                         base_dir,
