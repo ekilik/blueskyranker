@@ -704,7 +704,7 @@ class ActorEnricher:
                 import time
                 for name in tqdm(unique_names, desc="Wikidata queries"):
                     wikidata_results[name] = self.fetch_party_info(name, language=language)
-                    time.sleep(0.1)
+                    time.sleep(1)
 
                 # Match the party name with ideology from reference data if available
                 if self.ideology_reference_df is not None:
