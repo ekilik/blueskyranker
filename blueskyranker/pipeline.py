@@ -265,7 +265,6 @@ def run_fetch_rank_push(
                     mtime = datetime.fromtimestamp(pf.stat().st_mtime, tz=timezone.utc)
                     if mtime >= lookback_cutoff:
                         annotated_uris.update(pl.read_parquet(pf, columns=['uri'])['uri'].to_list())
-                        print(f"Loaded {len(annotated_uris)} annotated URIs from {pf} (modified {mtime.isoformat()})")
                 except Exception:
                     pass
 
