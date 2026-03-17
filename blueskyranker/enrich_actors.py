@@ -744,11 +744,13 @@ class ActorEnricher:
                         if not party_short:
                             continue
                         
-                        name_clean = name.strip() if name else None
+                        name_clean = self._normalize_string(name)
                         party_clean = self._normalize_string(party_short)
                         lrgen = ideology_lookup.get(party_clean)
                         if lrgen is None:
                             continue
+
+                        self.politician_reference_df = sorted(self.politician_reference_df, key=lambda x: x['name'])
 
                         self.politician_reference_df.append({
                             'name': name_clean,
