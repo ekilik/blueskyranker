@@ -23,7 +23,7 @@ from datetime import datetime, timezone, timedelta
 import polars as pl
 
 from .fetcher import Fetcher, ensure_db, load_posts_df, DEFAULT_SQLITE_PATH
-from .ranker import TopicRanker
+from .ranker import TopicRanker, ActorDiversityRanker
 from .actor_annotator import ActorAnnotator
 from .enrich_actors import ActorEnricher
 
@@ -319,7 +319,7 @@ def run_fetch_rank_push(
                 else:
                     logger.info(f"{h}: no annotation files found, skipping enrichment")
 
-        ranker = TopicRanker(
+        _ranker_kwargs = dict(
             returnformat='dataframe',
             method=method,
             descending=descending,
@@ -329,6 +329,21 @@ def run_fetch_rank_push(
             engagement_window_days=engagement_window_days,
             push_window_days=push_window_days,
         )
+        if actor_diversity:
+            enrich_path = Path('actor_annotation_batches') / f"{h.replace('.', '_')}_enriched.parquet"
+            if enrich_path.exists():
+                try:
+                    actor_stats_df = pl.read_parquet(enrich_path)
+                    ranker = ActorDiversityRanker(actor_stats=actor_stats_df, **_ranker_kwargs)
+                    logger.info(f"{h}: using ActorDiversityRanker with enriched actor stats from {enrich_path}")
+                except Exception as e:
+                    logger.error(f"{h}: failed to load enriched actor stats ({e}); falling back to TopicRanker")
+                    ranker = TopicRanker(**_ranker_kwargs)
+            else:
+                logger.warning(f"{h}: enriched actor stats not found at {enrich_path}; falling back to TopicRanker")
+                ranker = TopicRanker(**_ranker_kwargs)
+        else:
+            ranker = TopicRanker(**_ranker_kwargs)
 
         ranked = ranker.rank(df)
         if ranked.is_empty():
@@ -491,7 +506,12 @@ def run_fetch_rank_push(
                 'like_count','reply_count','quote_count','repost_count',
             ]
             # Some cluster stats may or may not be present; include when available
-            opt_cols = ['cluster_size_initial','cluster_size_engagement','cluster_size_push','cluster_engagement_count','cluster_engagement_rank']
+            opt_cols = [
+                'cluster_size_initial', 'cluster_size_engagement', 'cluster_size_push',
+                'cluster_engagement_count', 'cluster_engagement_rank',
+                'nr_actors_left', 'nr_actors_right', 'nr_actors_center',
+                'nr_actors_a', 'nr_actors_b', 'nr_actors_c', 'nr_actors_d', 'nr_actors_total',
+            ]
             existing_opt = [c for c in opt_cols if c in push_with_prio.columns]
             rows = push_with_prio.select(
                 [pl.col('prio').alias('priority')] + [pl.col(c) for c in cols[1:]] + [pl.col(c) for c in existing_opt]
