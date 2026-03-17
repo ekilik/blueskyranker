@@ -361,6 +361,7 @@ class TopicRanker(_BaseRanker):
         self._last_embeddings: Optional[np.ndarray] = None
         self._last_embedding_cid_to_idx: Dict[str, int] = {}
         self._last_sbert_model_name: Optional[str] = None
+        self._last_df_clustered: Optional[pl.DataFrame] = None
 
     def _ensure_text_column(self, df: pl.DataFrame) -> pl.DataFrame:
         """Guarantee that the text column is populated with meaningful content."""
@@ -758,7 +759,7 @@ class TopicRanker(_BaseRanker):
             return df_with_clusters
         enrichment_df = enrichments[0]
         for extra in enrichments[1:]:
-            enrichment_df = enrichment_df.join(extra, on='cluster', how='outer')
+            enrichment_df = enrichment_df.join(extra, on='cluster', how='full')
         df_with_clusters = df_with_clusters.join(enrichment_df, on='cluster', how='left')
         return df_with_clusters
         
@@ -832,13 +833,15 @@ class TopicRanker(_BaseRanker):
 
         if self.method == 'networkclustering-tfidf':
             df_with_clusters = self._cluster(df_cluster_base, similarity='tfidf-cosine')
-        if self.method == 'networkclustering-count':
+        elif self.method == 'networkclustering-count':
             df_with_clusters = self._cluster(df_cluster_base, similarity='count-cosine')
-        if self.method == 'networkclustering-sbert':
+        elif self.method == 'networkclustering-sbert':
             if len(df_cluster_base)>100:
                 logger.warning(f"Do you really want to do this? You have {len(df_cluster_base)} texts; calculating sentence embeddings will be REALLY slow")
                 logger.warning(f"Consider using another method, or submitting fewer documents")
             df_with_clusters = self._cluster(df_cluster_base, similarity='sbert-cosine')
+        else:
+            raise NotImplementedError(f"Unknown method: {self.method!r}")
         # Count clusters created over the clustered set (before any push-window filter)
         try:
             ncl = df_with_clusters.select(pl.col('cluster').n_unique().alias('n')).to_dicts()[0]['n']
@@ -884,6 +887,8 @@ class TopicRanker(_BaseRanker):
         df_with_clusters = self._add_cluster_stats(df_with_clusters, stats_subset=stats_subset)
         df_with_clusters = self._add_embedding_metrics(df_with_clusters)
         df_with_clusters = self._add_cluster_insights(df_with_clusters)
+        # Store the fully-annotated clustered DF so subclasses can re-use it without re-running clustering
+        self._last_df_clustered = df_with_clusters
 
         # Determine which rows are eligible for the push (apply push window BEFORE interleaving)
         if self.push_window_days is not None:
@@ -983,6 +988,267 @@ class TopicRanker(_BaseRanker):
                 )
                 raise RuntimeError(hint) from exc
             raise
+
+
+class ActorDiversityRanker(TopicRanker):
+    """Diversity ranker that selects articles within each cluster using greedy actor diversity.
+    Inherits all clustering logic from TopicRanker. Differs only in the within-cluster
+    article selection and the round-robin interleaving order.
+
+    Within each cluster the selection sequence is:
+      pos 1 – newest article (recency, same as TopicRanker)
+      pos 2 – article that maximises either political or social Simpson diversity with pos 1
+              (randomly chosen each run, so the feed varies across refreshes)
+      pos 3 – article that maximises the complementary dimension given {pos 1, pos 2}
+      pos 4+ – continues alternating the two dimensions
+
+    Posts are interleaved across clusters in bursts of `burst_size` (default 2), so a reader
+    sees slots 1+2 from every topic before any cluster's slot 3 appears.
+
+    Simpson Diversity Index: D = 1 − Σ(nᵢ/N)²
+      Political categories: nr_actors_left, nr_actors_right, nr_actors_center (if center_parties=True)
+      Social categories: nr_actors_a (political actors), nr_actors_b (experts/judicial),
+                         nr_actors_c (civil society/executive), nr_actors_d (citizens/other)
+
+    For each greedy step the combined actor-count vector of the current selected set plus
+    the candidate is evaluated; the candidate that maximises D is chosen.
+
+    Posts without actor annotation (all actor columns null) are excluded from ranking.
+    Cluster ordering across the round-robin interleave stays by engagement rank (same as
+    TopicRanker).
+
+    actor_stats must be the article-level DataFrame produced by ActorEnricher.run_full_enrichment()
+    joined on 'uri'.
+    """
+
+    def __init__(
+        self,
+        returnformat: Literal["id", "dicts", "dataframe"],
+        method: Literal['networkclustering-tfidf', 'networkclustering-count', 'networkclustering-sbert'],
+        descending: bool,
+        actor_stats: pl.DataFrame,
+        metric: Literal['like_count', 'quote_count', 'reply_count', 'repost_count', 'engagement'] = 'engagement',
+        similarity_threshold: float | None = None,
+        vectorizer_stopwords: str | list[str] | None = None,
+        cluster_window_days: int | None = None,
+        engagement_window_days: int | None = None,
+        push_window_days: int | None = None,
+        include_embedding_metrics: bool = False,
+        cluster_insights: Sequence[str] | str | None = None,
+        cluster_insight_options: Optional[Dict[str, Any]] | None = None,
+        burst_size: int = 2,
+        center_parties: bool = True,
+    ):
+        super().__init__(
+            returnformat=returnformat,
+            method=method,
+            descending=descending,
+            metric=metric,
+            similarity_threshold=similarity_threshold,
+            vectorizer_stopwords=vectorizer_stopwords,
+            cluster_window_days=cluster_window_days,
+            engagement_window_days=engagement_window_days,
+            push_window_days=push_window_days,
+            include_embedding_metrics=include_embedding_metrics,
+            cluster_insights=cluster_insights,
+            cluster_insight_options=cluster_insight_options,
+        )
+        self.actor_stats = actor_stats
+        self.burst_size = burst_size
+        self.center_parties = center_parties
+        self.POLITICAL_COLS: List[str] = ['nr_actors_left', 'nr_actors_right', 'nr_actors_center'] if center_parties else ['nr_actors_left', 'nr_actors_right']
+
+    SOCIAL_COLS: List[str] = ['nr_actors_a', 'nr_actors_b', 'nr_actors_c', 'nr_actors_d']
+
+    @staticmethod
+    def _simpson_diversity(counts: np.ndarray) -> float:
+        """Compute standardized Simpson Diversity Index D / (1 − 1/S)."""
+        N = float(counts.sum())
+        S = len(counts)
+        if N <= 0 or S <= 1:
+            return 0.0
+        D = 1.0 - float(np.sum((counts / N) ** 2))
+        return D / (1.0 - 1.0 / S)
+
+    @staticmethod
+    def _actor_vec(row: dict, cols: List[str]) -> np.ndarray:
+        """Extract actor-count vector from a row dict, replacing nulls with 0."""
+        return np.array([float(row.get(c) or 0) for c in cols], dtype=float)
+
+    def _greedy_next(
+        self,
+        candidates: List[dict],
+        selected_vecs: List[np.ndarray],
+        cols: List[str],
+    ) -> dict:
+        """Return the candidate that maximises Simpson diversity when added to the selected set.
+
+        Ties broken by recency (candidates must be pre-sorted newest-first).
+        """
+        base_vec = np.sum(selected_vecs, axis=0) if selected_vecs else np.zeros(len(cols))
+        best_score = -1.0
+        best_candidate = candidates[0]
+        for row in candidates:
+            candidate_vec = self._actor_vec(row, cols)
+            combined = base_vec + candidate_vec
+            score = self._simpson_diversity(combined)
+            if score > best_score:
+                best_score = score
+                best_candidate = row
+        return best_candidate
+
+    def rank(self, data: list[dict] | pl.DataFrame) -> list[dict] | pl.DataFrame | list[str]:
+        """Cluster posts via TopicRanker, then re-order within each cluster using greedy actor diversity."""
+        import random
+        from datetime import timedelta, timezone
+
+        # Step 1: run the full TopicRanker pipeline (clustering + engagement stats).
+        # This sets self._last_df_clustered (before push-window filter) on the parent.
+        super().rank(data)
+
+        if self._last_df_clustered is None:
+            logger.warning("ActorDiversityRanker: _last_df_clustered not set; returning TopicRanker result")
+            return self._transform_output(self.ranking)
+
+        df = self._last_df_clustered
+
+        # Step 2: join actor stats on uri.
+        actor_cols = self.POLITICAL_COLS + self.SOCIAL_COLS
+        available_actor_cols = [c for c in actor_cols if c in self.actor_stats.columns]
+        if not available_actor_cols:
+            logger.warning("ActorDiversityRanker: no actor stat columns in actor_stats; returning TopicRanker result")
+            return self._transform_output(self.ranking)
+
+        stats_to_join = self.actor_stats.select(['uri'] + available_actor_cols)
+        # Drop any actor columns already in df to avoid collision
+        existing_actor_cols = [c for c in available_actor_cols if c in df.columns]
+        if existing_actor_cols:
+            df = df.drop(existing_actor_cols)
+        df = df.join(stats_to_join, on='uri', how='left')
+
+        # Step 3: exclude posts with no actor annotation (all actor cols null).
+        df = df.filter(
+            pl.any_horizontal(*[pl.col(c).is_not_null() for c in available_actor_cols])
+        )
+        if df.is_empty():
+            logger.warning("ActorDiversityRanker: all posts excluded (no actor annotation); returning empty ranking")
+            self.ranking = df.head(0)
+            return self._transform_output(self.ranking)
+
+        # Step 4: apply push window.
+        now = datetime.now(timezone.utc)
+        if self.push_window_days is not None:
+            push_cutoff = now - timedelta(days=int(self.push_window_days))
+            eligible = df.filter(pl.col('createdAt_dt') >= push_cutoff)
+        else:
+            eligible = df
+
+        if eligible.is_empty():
+            logger.warning("ActorDiversityRanker: no posts in push window after actor filtering")
+            self.ranking = eligible.head(0)
+            return self._transform_output(self.ranking)
+
+        # Step 5: build cluster order by engagement rank (same as TopicRanker).
+        try:
+            cluster_order = (
+                eligible
+                .select(['cluster', 'cluster_engagement_rank'])
+                .unique(maintain_order=True)
+                .group_by('cluster')
+                .agg(pl.col('cluster_engagement_rank').first())
+                .sort('cluster_engagement_rank', descending=not self.descending)
+                .select('cluster')
+                .to_series()
+                .to_list()
+            )
+        except Exception:
+            logger.warning("ActorDiversityRanker: failed to compute cluster order", exc_info=True)
+            cluster_order = []
+
+        avail_political = [c for c in self.POLITICAL_COLS if c in eligible.columns]
+        avail_social = [c for c in self.SOCIAL_COLS if c in eligible.columns]
+
+        # Step 6: greedy diversity selection within each cluster.
+        per_cluster_rows: List[List[dict]] = []
+        for cid in cluster_order:
+            try:
+                candidates = (
+                    eligible
+                    .filter(pl.col('cluster') == cid)
+                    .sort('createdAt_dt', descending=True)
+                    .rows(named=True)
+                )
+            except Exception:
+                candidates = []
+            if not candidates:
+                continue
+
+            selected: List[dict] = []
+            remaining = list(candidates)
+
+            # pos 1: newest
+            selected.append(remaining.pop(0))
+
+            if remaining:
+                # pos 2: randomly choose political or social diversity maximiser vs slot 1
+                if avail_political and avail_social:
+                    first_mode = random.choice(['political', 'social'])
+                elif avail_political:
+                    first_mode = 'political'
+                elif avail_social:
+                    first_mode = 'social'
+                else:
+                    first_mode = None
+
+                if first_mode is None:
+                    selected.extend(remaining)
+                    remaining = []
+                else:
+                    slot2_cols = avail_political if first_mode == 'political' else avail_social
+                    slot2 = self._greedy_next(remaining, [self._actor_vec(selected[0], slot2_cols)], slot2_cols)
+                    remaining.remove(slot2)
+                    selected.append(slot2)
+
+                    # pos 3+: start with complementary dimension, then alternate
+                    second_mode = 'social' if first_mode == 'political' else 'political'
+                    mode_cycle = [second_mode, first_mode]
+                    mode_idx = 0
+                    while remaining:
+                        mode = mode_cycle[mode_idx % 2]
+                        mode_idx += 1
+                        cols = avail_political if mode == 'political' else avail_social
+                        if not cols:
+                            selected.append(remaining.pop(0))
+                            continue
+                        sel_vecs = [self._actor_vec(r, cols) for r in selected]
+                        next_row = self._greedy_next(remaining, sel_vecs, cols)
+                        remaining.remove(next_row)
+                        selected.append(next_row)
+
+            per_cluster_rows.append(selected)
+
+        # Step 7: burst interleave across clusters — `burst_size` articles per cluster per pass.
+        interleaved: List[dict] = []
+        max_len = max((len(rows) for rows in per_cluster_rows), default=0)
+        for start in range(0, max_len, self.burst_size):
+            for rows in per_cluster_rows:
+                interleaved.extend(rows[start:start + self.burst_size])
+        final_ranking = pl.DataFrame(interleaved) if interleaved else eligible.head(0)
+
+        # Add push-window cluster sizes for transparency.
+        try:
+            push_sizes = eligible.group_by('cluster').agg(pl.len().alias('cluster_size_push'))
+            if 'cluster_size_push' not in final_ranking.columns:
+                final_ranking = final_ranking.join(push_sizes, on='cluster', how='left')
+        except Exception:
+            logger.warning("ActorDiversityRanker: failed to join push-window cluster sizes", exc_info=True)
+
+        self.ranking = final_ranking
+        try:
+            self.meta['push_posts'] = int(final_ranking.height)
+        except Exception:
+            self.meta['push_posts'] = 0
+        return self._transform_output(final_ranking)
 
 
 def sampledata(filename: str | None = None):
