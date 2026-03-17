@@ -87,7 +87,6 @@ def run_fetch_rank_push(
     annotator_timeout: int = 120,
     annotator_lookback_hours: int = 24,
     # Actor enricher options (used when actor_diversity=True)
-    enricher_language: str = 'en',
     enricher_politicians_data_path: Optional[str] = None,
     enricher_center_parties: bool = True,
     enricher_use_wikidata: bool = True,
@@ -304,7 +303,7 @@ def run_fetch_rank_push(
                         ann_df = pl.concat([pl.read_parquet(f) for f in ann_files])
                         _lang_map = {'nl': 'nl', 'ir': 'en', 'cz': 'cs', 'fr': 'fr'}
                         _code = h.split('.')[0].rsplit('-', 1)[-1].lower()
-                        handle_language = _lang_map.get(_code, enricher_language)
+                        handle_language = _lang_map.get(_code, 'en')
                         enricher = ActorEnricher(
                             actor_df=ann_df,
                             language=handle_language,
@@ -745,8 +744,6 @@ def main():
                    help='Per-request timeout in seconds for actor annotation (default: 120)')
     p.add_argument('--annotator-lookback-hours', dest='annotator_lookback_hours', type=int, default=24,
                    help='Skip articles already annotated within this many hours (default: 24)')
-    p.add_argument('--enricher-language', dest='enricher_language', default='en',
-                   help='Language for NER in actor enrichment (default: en)')
     p.add_argument('--enricher-politicians-data-path', dest='enricher_politicians_data_path', default=None,
                    help='Path to CSV with politician reference data (name, party, lrgen_category)')
     p.add_argument('--enricher-center-parties', dest='enricher_center_parties', action='store_true', default=True,
@@ -784,7 +781,6 @@ def main():
         annotator_ollama_host=args.annotator_ollama_host,
         annotator_timeout=args.annotator_timeout,
         annotator_lookback_hours=args.annotator_lookback_hours,
-        enricher_language=args.enricher_language,
         enricher_politicians_data_path=args.enricher_politicians_data_path,
         enricher_center_parties=args.enricher_center_parties,
         enricher_use_wikidata=args.enricher_use_wikidata,
