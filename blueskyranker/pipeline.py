@@ -302,9 +302,12 @@ def run_fetch_rank_push(
                 if ann_files:
                     try:
                         ann_df = pl.concat([pl.read_parquet(f) for f in ann_files])
+                        _lang_map = {'nl': 'nl', 'ir': 'en', 'cz': 'cs', 'fr': 'fr'}
+                        _code = h.split('.')[0].rsplit('-', 1)[-1].lower()
+                        handle_language = _lang_map.get(_code, enricher_language)
                         enricher = ActorEnricher(
                             actor_df=ann_df,
-                            language=enricher_language,
+                            language=handle_language,
                             politicians_data_path=enricher_politicians_data_path,
                             center_parties=enricher_center_parties,
                         )
